@@ -1,52 +1,114 @@
-"""Measured operating point for the Step-3.7-Flash fleet.
+"""Measured operating point + v0.2 fleet parameters for Step-3.7-Flash.
 
 Provenance: ~/bench/step37-mtp/FLEET_OPTIMUM.md (live-measured, 2x RTX PRO 6000).
 For ~8K-token workers the efficient in-flight region is C32 (latency-aware:
 763 tok/s, 23.8 tok/s/agent) .. C64 (throughput-max: 1225 tok/s, ~9.8x single-stream).
 Single-stream is ~125 tok/s, so the fleet's whole point is keeping dozens in flight.
+
+v0.2 (recon-grounded — see BUILD_SPEC.md): HermesAgent is SYNC+THREADED and stateless
+(full-history resend), so the server holds KV only for *currently generating* requests.
+The harness therefore bounds concurrent *generations* with a resizable DecodeGate and
+oversubscribes enrolled workers (tool-executing workers hold no server KV).
 """
 import os
 
-# HermesAgent install (its venv must be the runtime python so `run_agent` imports).
+
+def _envf(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _envi(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# ── HermesAgent install (its venv must be the runtime python so run_agent imports) ──
 HERMES_DIR = os.environ.get("HERMES_DIR", "/home/hikari/.hermes/hermes-agent")
 
-# Inference server (the local Step-3.7-Flash NVFP4 + MTP K=1 endpoint).
+# ── Inference server (the local Step-3.7-Flash NVFP4 + MTP K=1 endpoint) ──
 BASE_URL = os.environ.get("FLEET_BASE_URL", "http://127.0.0.1:8001/v1")
 MODEL = os.environ.get("FLEET_MODEL", "step3p7")
 API_KEY = os.environ.get("FLEET_API_KEY", "EMPTY")
 METRICS_URL = os.environ.get("FLEET_METRICS_URL", "http://127.0.0.1:8001/metrics")
 
-# Target number of agents DECODING at once. The measured efficient region is 32–64;
-# 40 is a balanced default. The scheduler holds this many in flight (admission control).
-TARGET_INFLIGHT = int(os.environ.get("FLEET_INFLIGHT", "40"))
+# ── Worker turn budget (BUG FIX) ─────────────────────────────────────────────
+# v0.1 defined WORKER_MAX_TURNS=12 but never passed it, so workers ran at the
+# AIAgent default max_iterations=90. compat.make_agent now passes MAX_ITERATIONS.
+MAX_ITERATIONS = _envi("FLEET_MAX_ITERATIONS", 12)
+WORKER_MAX_TURNS = MAX_ITERATIONS  # backwards-compat alias
 
-# Worker turn budget. Keep worker context BOUNDED (~8–16K): the data shows usable
-# concurrency collapses as context grows (32K saturates ~C8 vs 8K's ~C48-64), so a
-# real harness should compact/summarize rather than let a worker grow to 32K+.
-WORKER_MAX_TURNS = int(os.environ.get("FLEET_MAX_TURNS", "12"))
+# ── Per-generation output cap (bounded-generation sweep) ─────────────────────
+# FLEET_MAX_TOKENS caps each worker's output tokens so the sweep is one clean
+# ~200-token generation per task (predictable decode batch, comparable points).
+# None (unset) = the model/server default (no harness-imposed cap). AIAgent takes
+# a native `max_tokens` kwarg (verified run_agent.py:390 -> init_agent), where
+# None means "don't send max_tokens". compat.make_agent + worker.run_task read
+# getattr(config, "MAX_TOKENS", None), so leaving this None preserves old behaviour.
+def _envi_or_none(name):
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
-# Per-task retry budget (failed tasks are requeued up to this many times).
-MAX_RETRIES = int(os.environ.get("FLEET_MAX_RETRIES", "1"))
 
-# --- Per-role MINIMAL toolsets (the big lean-worker lever) -------------------
-# Giving every worker all ~39 tools + every MCP server is huge redundant prefill
-# (a smoke run measured ~5K tokens/request, mostly tool schemas) AND makes the
-# model reason over tools it will never use. Each lane loads ONLY what its role
-# needs, via HermesAgent's AIAgent(enabled_toolsets=...). Pure-reasoning roles get
-# NO tools. Keeping the per-role toolset STABLE + identical also lets vLLM
-# prefix-cache the shared prefix across same-role workers (tool prefill paid once).
-# Token cost of the system+tools prefix per profile is MEASURED on the live server
-# (workflow analysis): default(39 tools)=14,113 tok; coder[file,terminal,search]=3,328
-# (-77%); researcher[web,search]=398 (-97%); reducer[file]=1,459 (-90%). Same-role
-# byte-identical prefix => vLLM auto prefix-cache serves it after worker #1 (~-98%).
+MAX_TOKENS = _envi_or_none("FLEET_MAX_TOKENS")  # None = model default (no cap)
+
+# ── Static admission (process-engine / --admission static) ───────────────────
+# Target number of agents DECODING at once. Measured efficient region 32–64; 40 default.
+TARGET_INFLIGHT = _envi("FLEET_INFLIGHT", 40)
+MAX_RETRIES = _envi("FLEET_MAX_RETRIES", 1)
+
+# ── DecodeGate (v0.2) — bounds concurrent *generations* == server num_requests_running ──
+DECODE_GATE_ENABLED = os.environ.get("FLEET_DECODE_GATE", "1") not in ("0", "false", "False")
+DECODE_GATE_START = _envi("FLEET_GATE_START", 40)   # initial concurrent-generation limit
+DECODE_GATE_MIN = _envi("FLEET_GATE_MIN", 8)        # never below this (workers would block forever)
+DECODE_GATE_MAX = _envi("FLEET_GATE_MAX", 96)       # ceiling for the AIMD search
+KNEE_LO = _envi("FLEET_KNEE_LO", 32)                # measured efficient region (FLEET_OPTIMUM §4)
+KNEE_HI = _envi("FLEET_KNEE_HI", 64)
+
+# ── Oversubscription — enrolled workers >> gate limit (tool-executing hold no KV) ──
+# Enrolled must stay AHEAD of the gate's real duty or the gate starves: at agent
+# duty d (fraction of wall actually decoding), keeping the gate full needs roughly
+# enrolled ≈ gate_limit / d_min surplus over the gate (tool-executing/blocked workers
+# hold ZERO server KV — recon fact #3, threads are heap-only and cheap). At the
+# default gate START=40 and a low real duty, OVERSUB=2.0/ENROLL_MAX=160 left the
+# gate under-fed in the lead's sweep, so RAISE the defaults. Still env-overridable
+# (the lead sets FLEET_OVERSUB / FLEET_ENROLL_MAX per sweep point).
+OVERSUB_FACTOR = _envf("FLEET_OVERSUB", 3.0)        # enrolled = factor × gate_limit
+ENROLL_MAX = _envi("FLEET_ENROLL_MAX", 256)         # hard cap on concurrent worker threads
+
+# ── AIMD dynamic-admission controller (--admission aimd) ─────────────────────
+AIMD_INTERVAL_S = _envf("FLEET_AIMD_INTERVAL", 4.0)  # control period
+AIMD_STRIDE = _envi("FLEET_AIMD_STRIDE", 8)          # additive-increase step on the gate limit
+AIMD_BACKOFF = _envf("FLEET_AIMD_BACKOFF", 0.7)      # multiplicative-decrease factor
+AIMD_KV_HI = _envf("FLEET_AIMD_KV_HI", 0.85)         # KV usage backoff threshold (0..1)
+AIMD_TPUT_DROP = _envf("FLEET_AIMD_TPUT_DROP", 0.07) # rel. tok/s regression that triggers backoff
+AIMD_SATURATION = _envf("FLEET_AIMD_SAT", 0.9)       # only grow if running >= limit*this (gate full)
+
+# ── Persistent board (None = in-memory) ──────────────────────────────────────
+BOARD_PATH = os.environ.get("FLEET_BOARD_PATH") or None
+
+# ── Per-role MINIMAL toolsets (the big lean-worker lever) ─────────────────────
+# Default 39 tools ≈ 14,113 tok prefill re-paid by every worker every turn (stateless
+# resend). Each lane loads ONLY what its role needs (verified valid leaf toolsets, recon
+# `toolset-name-validation`): []=0 tools, todo=1, web=2, file+terminal+search=7, +code_exec=8.
+# Same-role byte-identical prefix => vLLM auto prefix-cache serves it after worker #1.
 TOOL_PROFILES = {
     "director": ["todo"],                               # holds plan; minimal
-    "router":   [],                                     # classify / route only
-    "reducer":  [],                                     # pure synthesis of upstream results
     "planner":  ["todo"],                               # decompose; minimal
-    "worker":   ["file", "terminal", "search"],         # default coder (~3,328 tok, -77%)
+    "reducer":  [],                                     # pure synthesis of upstream results (0 tools)
+    "router":   [],                                     # classify / route only (0 tools)
+    "worker":   ["file", "terminal", "search"],         # default lean coder (~3,328 tok, -77%)
     "code":     ["file", "terminal", "search", "code_execution"],
-    "research": ["web", "search"],                      # (~398 tok, -97%)
+    "research": ["web"],                                # 'web' already supersets web_search (recon)
 }
 
 
@@ -54,12 +116,30 @@ def toolsets_for(lane: str):
     return TOOL_PROFILES.get(lane, TOOL_PROFILES["worker"])
 
 
-# --- Agent ROSTER: heterogeneous context / role / count over the KV budget ---
-# The fleet is NOT uniform-context. ONE long-horizon DIRECTOR (big context, steers
-# the whole task via the board, rarely decodes) + a few planners/reducers + the bulk
-# of lean ~8K workers + tiny routers. KV (1,625,950 fp8 tokens) is a shared budget:
-# reserve the few-but-big roles first; the worker lane is the elastic remainder.
-# Provenance of the worker operating point: ~/bench/step37-mtp/FLEET_OPTIMUM.md.
+# ── Lane priority for the DecodeGate waterfall (#4): higher = served first ────
+# director/planner/reducer get decode slots ahead of the worker swarm so reserved
+# roles never starve behind the bulk. (Per-lane hard reservations are a refinement.)
+LANE_PRIORITY = {
+    "director": 100,
+    "planner":  80,
+    "reducer":  60,
+    "code":     45,
+    "research": 42,
+    "worker":   40,
+    "router":   20,
+}
+
+
+def lane_priority(lane: str) -> int:
+    return LANE_PRIORITY.get(lane, LANE_PRIORITY["worker"])
+
+
+# ── Agent ROSTER: heterogeneous context / role / count over the KV budget ─────
+# KV (1,625,950 fp8 tokens) is a shared budget. Under the stateless-completions model
+# (recon fact #2) resident KV ≈ concurrent-DECODING count × per-turn tokens, NOT enrolled
+# count — so the gate (not the roster) is what bounds KV. The roster sizes role mix + the
+# decode-priority waterfall; see fleet/roster.py for both the resident and the (pessimistic)
+# enrolled views.
 KV_BUDGET = 1_625_950
 
 ROSTER = {
@@ -73,7 +153,36 @@ ROSTER = {
                      note="tree fan-in; near-root reducers grow toward larger context"),
     "worker":   dict(context=8192,   count=48, tools=["file", "terminal", "search"], duty=0.40,
                      elastic=True,
-                     note="the BULK; ephemeral lean coders, measured C32-64 operating point (count = in-flight target)"),
+                     note="the BULK; ephemeral lean coders, measured C32-64 operating point (count = decode target)"),
     "router":   dict(context=2048,   count=16, tools=[],                         duty=0.20,
                      note="classify/route; near-free, high churn"),
 }
+
+
+# ── Startup validation ───────────────────────────────────────────────────────
+# Fail FAST and LOUD on an inconsistent env rather than deadlocking or thrashing at
+# runtime. The DecodeGate never deadlocks while limit >= 1 (compat.DecodeGate), and
+# the AIMD controller clamps into [MIN, MAX] — both rely on these invariants holding.
+def validate() -> None:
+    """Assert the operating-point invariants. Raises ValueError on bad env so a
+    misconfigured sweep aborts at import, not 40 threads deep into a live run."""
+    problems = []
+    if DECODE_GATE_MIN < 1:
+        problems.append(
+            f"DECODE_GATE_MIN must be >= 1 (gate deadlocks at 0); got {DECODE_GATE_MIN} "
+            f"(env FLEET_GATE_MIN)")
+    if DECODE_GATE_MIN > DECODE_GATE_MAX:
+        problems.append(
+            f"DECODE_GATE_MIN ({DECODE_GATE_MIN}) must be <= DECODE_GATE_MAX "
+            f"({DECODE_GATE_MAX}) (env FLEET_GATE_MIN / FLEET_GATE_MAX)")
+    if ENROLL_MAX < 1:
+        problems.append(
+            f"ENROLL_MAX must be >= 1 (no worker threads otherwise); got {ENROLL_MAX} "
+            f"(env FLEET_ENROLL_MAX)")
+    if problems:
+        raise ValueError(
+            "fleet.config: invalid configuration:\n  - " + "\n  - ".join(problems))
+
+
+# Validate at import so any importer (cli, engine, roster, tests) fails fast.
+validate()

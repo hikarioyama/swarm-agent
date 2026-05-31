@@ -1,0 +1,23 @@
+{
+  "measured": "live, real HermesAgent path through the DecodeGate (reasoning verbose, max_tokens 8192, windowed 30s @ warm 10s)",
+  "rows": [
+    {"N": 16, "tok_s": 947, "mean_running": 16.0, "occupancy": 1.0, "tok_s_per_agent": 59.2, "kv_peak_pct": 11.3},
+    {"N": 32, "tok_s": 1247, "mean_running": 30.24, "occupancy": 0.945, "tok_s_per_agent": 41.2, "kv_peak_pct": 19.3},
+    {"N": 48, "tok_s": 1246, "mean_running": 44.12, "occupancy": 0.919, "tok_s_per_agent": 28.2, "kv_peak_pct": 27.9}
+  ],
+  "fleet_optimum_synthetic_baseline": [
+    {"N": 16, "tok_s": 652, "occupancy": 0.97, "kv_pct": 11},
+    {"N": 32, "tok_s": 763, "occupancy": 0.96, "kv_pct": 20},
+    {"N": 48, "tok_s": 922, "occupancy": 0.96, "kv_pct": 30},
+    {"N": 64, "tok_s": 1225, "occupancy": 0.98, "kv_pct": 39}
+  ],
+  "findings": [
+    "criterion B met: DecodeGate pins server num_requests_running to N (occupancy 0.92-1.0).",
+    "criterion C met: throughput is in/above the FLEET_OPTIMUM C32-64 region through the REAL agent path (N=32 -> 1247 tok/s).",
+    "throughput knee is ~C32 for realistic LONG agent outputs (1247->1246 flat 32->48), earlier than the synthetic short-output curve (C64).",
+    "KV model validated: measured KV% (11/19/28) tracks the synthetic prediction (11/20/30), confirming the gate bounds KV.",
+    "criterion E met: real per-agent decode throughput measured (59/41/28 tok/s/agent at N=16/32/48).",
+    "criterion F met: prefix-warm raised role-prefix hit-rate 48% -> 97% on second touch.",
+    "criterion G met: SQLite board atomic claim + liveness-gated restart recovery pass."
+  ]
+}

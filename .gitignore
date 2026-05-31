@@ -3,3 +3,8 @@ __pycache__/
 *.egg-info/
 fleet_results*.jsonl
 /tmp/
+examples/sweep_8k.jsonl
+results/live_sweep.json
+*.db
+*.db-wal
+*.db-shm

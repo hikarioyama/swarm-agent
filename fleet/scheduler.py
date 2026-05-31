@@ -1,4 +1,4 @@
-"""The concurrency controller — the heart of the harness.
+"""The ProcessPool concurrency controller — the v0.1 fallback engine.
 
 This is deliberately DUMB and FAST: no LLM, no reasoning. It just keeps
 TARGET_INFLIGHT workers busy by pulling ready tasks off the Board and feeding a
@@ -11,6 +11,12 @@ Admission control holds exactly `inflight` requests in flight (the measured
 efficient region for ~8K workers is C32–C64; default 40). A `/metrics` peek is
 provided so a later version can target the throughput knee dynamically instead of
 a fixed number.
+
+v0.2 keeps this engine intact as the fallback / A-B comparator. The default hot
+path is the single-process `engine.ThreadFleet` (one process, a thread per worker,
+a resizable DecodeGate + AIMD admission); the CLI selects between them via
+`--engine {thread,process}`. Use `build_engine(...)` to construct whichever the
+caller picked.
 """
 from __future__ import annotations
 import time
@@ -73,3 +79,23 @@ class Scheduler:
                         self._emit("requeue" if requeued else "fail", tid, error=repr(e)[:160])
         return {"counts": self.board.counts(), "wall_s": round(time.time() - self.t0, 1),
                 "results": self.board.results()}
+
+
+def build_engine(engine: str, board, *, gate=None, inflight: int = config.TARGET_INFLIGHT,
+                 on_event: Optional[Callable[..., None]] = None):
+    """Factory the CLI uses to pick the hot path.
+
+    ``engine="thread"``  -> ``engine.ThreadFleet`` (single-process ThreadPool +
+                            DecodeGate; the v0.2 default). Requires a ``gate``.
+    ``engine="process"`` -> this ``Scheduler`` (ProcessPool, fixed inflight;
+                            the v0.1 fallback / A-B comparator). Ignores ``gate``.
+
+    Returned object always exposes ``.run() -> summary``. ThreadFleet is imported
+    lazily so importing this module never pulls the thread engine if unused.
+    """
+    if engine == "process":
+        return Scheduler(board, inflight=inflight, on_event=on_event)
+    if engine == "thread":
+        from .engine import ThreadFleet
+        return ThreadFleet(board, gate, cfg=config, on_event=on_event)
+    raise ValueError(f"unknown engine {engine!r} (expected 'thread' or 'process')")

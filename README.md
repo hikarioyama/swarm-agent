@@ -11,6 +11,30 @@ agents in flight**. Measured efficient region for ~8K-token workers is **C32–C
 (C32 ≈ 763 tok/s @ 23.8 tok/s/agent; C64 ≈ 1225 tok/s, ~9.8× single-stream). Full
 data: `~/bench/step37-mtp/FLEET_OPTIMUM.md`.
 
+## v0.2 — measured results (real agent path)
+
+v0.2 drives the **real HermesAgent** through a resizable **DecodeGate** in a
+**single-process thread pool** (HermesAgent is sync+threaded, not asyncio) with **AIMD**
+dynamic admission. Live-measured through the gate (windowed 30 s, `results/operating_point.json`):
+
+| in-flight N | tok/s | occupancy | tok/s/agent | KV% |
+|---:|---:|---:|---:|---:|
+| 16 | 947  | 1.00  | 59.2 | 11.3 |
+| 32 | **1247** | 0.945 | 41.2 | 19.3 |
+| 48 | 1246 | 0.919 | 28.2 | 27.9 |
+
+- **Reaches/exceeds the synthetic C32–64 region through the real agent path** (N=32 → 1247 tok/s, ≈ the synthetic C64).
+- **Throughput knee is ~C32** for realistic long agent outputs (32→48 is flat) — earlier than the short-output synthetic curve.
+- **DecodeGate pins `num_requests_running` to N** (occupancy 0.92–1.0) — concurrency control validated.
+- **KV bound validated**: measured KV% (11/19/28) tracks the prediction (11/20/30). Because HermesAgent is stateless
+  (full-history resend), tool-executing workers hold **zero** server KV, so "parking" is automatic.
+- **AIMD converges** to the knee (~C32) and oscillates without thrash/deadlock; **prefix-warm** lifts the role-prefix
+  cache hit-rate 48% → 97%; **SQLite board** gives atomic claim + liveness-gated restart recovery.
+
+A 6-agent adversarial review found and we fixed CRITICAL/MAJOR concurrency bugs (gate phantom-ticket leak, enrolled-clamp
+inversion, kv summed across labels, AIMD saturation/EWMA, board write-guards + reset liveness, per-worker sandbox isolation).
+The hermes-agent repo is **never modified** — all adaptation is runtime monkeypatch in `fleet/compat.py`. See `BUILD_SPEC.md`.
+
 ## Design (why it doesn't "panic")
 
 - **Stigmergic coordination** — workers never talk to each other or to a central
@@ -55,13 +79,18 @@ Your code is in `~/projects/step37-harness/` (its own git). The plugin is
 symlinked into `~/.hermes/plugins/` — **outside** `~/.hermes/hermes-agent/`, so
 `git pull` in the HermesAgent repo never conflicts.
 
-## Roadmap (v2)
-- **KV-portfolio lanes** — heterogeneous context by role (router ~1K / worker ~8-16K /
-  reducer 8K→big / planner 40-60K), a priority waterfall over the 1.63M-token KV
-  budget, worker lane as elastic basin (FLEET_OPTIMUM.md §5).
-- **Dynamic admission** — target the throughput knee via `/metrics` instead of a
-  fixed number (`decoding_now()` is already wired).
-- **Tree reduction** — log-depth fan-in reducers instead of a star.
-- **Persistent board** — SQLite/file backing for restart-safety + multi-producer.
-- **Prefix-cache-aware dispatch** — share a common worker prefix to cut prefill
-  (measurements were worst-case, cache off; real fleet should run hotter).
+## v0.2 roadmap status (all landed + verified)
+- **Single-process engine** — `engine.ThreadFleet` (thread pool; HermesAgent is sync+threaded). ✅
+- **Decode-batch admission** — `compat.DecodeGate` pins concurrent generations == server KV. ✅
+- **Dynamic admission** — `admission.AIMDController` targets the knee via `/metrics`. ✅
+- **KV-portfolio lanes** — lane-priority gate acquire (`config.LANE_PRIORITY`). ✅
+- **Prefix-warm** — `warm.warm_profiles` warms each role prefix (hit-rate 48%→97%). ✅
+- **Persistent board** — `board.SqliteBoard` + `open_board` (atomic claim, restart-safe). ✅
+
+Run the v0.2 thread engine: `python -m fleet.cli tasks.jsonl --engine thread --admission aimd --warm`.
+Reproduce the operating point: `python scripts/throughput_probe.py --gate 32`.
+
+### Still open
+- **C96+** — needs an N-proportional warm-up to measure as steady state (gate MAX is 96).
+- **Tree reduction** — log-depth fan-in reducers (the board supports it; not yet a helper).
+- **Ungated summary path** — iteration-limit summary generations bypass the gate (rare; review #9, deferred).
