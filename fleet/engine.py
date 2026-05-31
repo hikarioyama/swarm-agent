@@ -27,7 +27,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable, Dict, Optional
 
 from . import config, metrics
-from .worker import run_task_local
+from .worker import has_visible_text, run_task_local
 
 
 def _enrolled_target(gate, cfg) -> int:
@@ -168,6 +168,8 @@ class ThreadFleet:
                         tid = futs.pop(f)
                         try:
                             res = f.result()
+                            if not has_visible_text(res.get("text", "")):
+                                raise RuntimeError("worker returned an empty visible response")
                             results[tid] = res
                             self.board.complete(tid, res.get("text", ""))
                             self._emit("done", tid, counts=tick_counts,

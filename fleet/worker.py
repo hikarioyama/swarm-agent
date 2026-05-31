@@ -29,6 +29,11 @@ from typing import Any, Dict
 from . import config
 
 
+def has_visible_text(text: str) -> bool:
+    """Reject Hermes placeholders produced after exhausted empty-response retries."""
+    return str(text or "").strip().lower() not in {"", "(empty)", "[empty]", "<empty>"}
+
+
 def _final_text(messages, final_response=None) -> str:
     """Best plain-text answer: prefer the loop's ``final_response`` if present,
     else the last assistant message content (string or content-block list)."""

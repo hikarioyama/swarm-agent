@@ -1,12 +1,13 @@
 [project]
-name = "step37-harness"
+name = "swarm-agent"
 version = "0.1.0"
-description = "High-concurrency fleet orchestrator for Step-3.7-Flash on top of HermesAgent"
+description = "Swarm-native high-concurrency agent harness for Step-3.7-Flash"
 requires-python = ">=3.10"
 dependencies = []   # uses HermesAgent's venv at runtime (imports run_agent)
 
 [project.scripts]
 fleet = "fleet.cli:main"
+swarm = "swarm_agent.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["fleet*"]
+include = ["fleet*", "swarm_agent*"]

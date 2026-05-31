@@ -471,18 +471,32 @@ def make_agent(lane: str, *, base_url: str = None, api_key: str = None, model: s
     # config agent; tolerate its absence on older trees → None = model default).
     mt = getattr(config, "MAX_TOKENS", None) if max_tokens is _UNSET else max_tokens
 
+    # PERSONA front door: router/planner/reducer speak AS the user's HermesAgent —
+    # give them SOUL.md identity + persistent MEMORY/USER memory; the worker swarm
+    # stays lean. Resolved defensively so an older config.py (no is_persona_lane)
+    # falls back to the original all-lean behaviour.
+    try:
+        _persona = config.is_persona_lane(lane)
+    except Exception:
+        _persona = False
+
     agent = AIAgent(
         base_url=base_url or config.BASE_URL,
         api_key=api_key or config.API_KEY,
         model=model or config.MODEL,
         enabled_toolsets=config.toolsets_for(lane),     # role-minimal tools
-        skip_context_files=True,                        # no SOUL.md/AGENTS.md in the prefix
-        skip_memory=True,                               # no persistent-memory injection
+        # PERSONA lanes: inject SOUL.md (load_soul_identity=True) while KEEPING
+        # skip_context_files=True, so the persona loads but the harness repo's cwd
+        # AGENTS.md/.cursorrules never enter the prefix (system_prompt.py:90 loads
+        # SOUL via the load_soul_identity branch; :263 gates cwd files on
+        # not skip_context_files). WORKERS: both off → byte-identical lean prefix.
+        skip_context_files=True,                        # NEVER inject cwd AGENTS.md/.cursorrules
+        load_soul_identity=_persona,                    # True for persona → SOUL.md identity
+        skip_memory=not _persona,                       # False for persona → MEMORY/USER injected
         save_trajectories=False,                        # no per-turn trajectory disk writes
         quiet_mode=True,                                # cut logging contention under 120 threads
         max_iterations=config.MAX_ITERATIONS if max_iterations is None else max_iterations,
-        tool_delay=0.0,                                 # FIX #4: kill the default 1.0s inter-tool
-                                                        # sleep (inflates tool_s, depresses duty)
+        tool_delay=0.0,                                 # FIX #4: kill the default 1.0s inter-tool sleep
         max_tokens=mt,                                  # FIX #7: bounded-generation cap (None=default)
         session_id=sid,                                 # TS1: unique sandbox/cwd/registry
     )

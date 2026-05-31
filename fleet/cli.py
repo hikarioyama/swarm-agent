@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from . import board as board_mod
 from .board import Task
@@ -122,9 +123,15 @@ def _exit_code(out, engine: str) -> int:
     return 0 if (failed == 0 and stranded == 0) else 1
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="fleet", description="Step-3.7 high-concurrency fleet")
-    ap.add_argument("tasks", help="JSONL file of tasks ({id, prompt, deps?, lane?})")
+def main(argv=None, *, prog="fleet") -> int:
+    ap = argparse.ArgumentParser(
+        prog=prog,
+        description="Swarm-agent: Step-3.7 high-concurrency agent harness",
+    )
+    ap.add_argument("tasks", nargs="?", help="JSONL file of tasks ({id, prompt, deps?, lane?})")
+    ap.add_argument("--goal", help="high-level goal: planner generates a parallel task DAG")
+    ap.add_argument("--plan-out", help="write the planner-generated JSONL DAG")
+    ap.add_argument("--final-out", help="write the single sink reducer result")
     ap.add_argument("--engine", choices=("thread", "process"), default="thread",
                     help="thread = single-process ThreadPool + DecodeGate (default); "
                          "process = ProcessPool fallback / A-B")
@@ -145,9 +152,19 @@ def main(argv=None) -> int:
                     help=f"process-engine fixed in-flight (default {config.TARGET_INFLIGHT})")
     ap.add_argument("--out", default="fleet_results.jsonl")
     args = ap.parse_args(argv)
+    if bool(args.tasks) == bool(args.goal):
+        ap.error("provide exactly one of TASKS or --goal")
 
     board = _open_board(args.board)
-    board.add_many(load_tasks(args.tasks))
+    if args.goal:
+        from swarm_agent.goal import plan_goal, write_plan
+        tasks = plan_goal(args.goal)
+        if args.plan_out:
+            write_plan(tasks, args.plan_out)
+        print(f"planner: generated {len(tasks)} DAG tasks", flush=True)
+    else:
+        tasks = load_tasks(args.tasks)
+    board.add_many(tasks)
     total = board.unfinished()
 
     # ── process engine: the v0.1 fallback path (no gate / no AIMD) ───────────
@@ -160,6 +177,7 @@ def main(argv=None) -> int:
         out = Scheduler(board, inflight=args.inflight, on_event=prog).run()
         _write_results(out, args.out)
         _report(out, args, None, None)
+        _write_final(out, args.final_out)
         return _exit_code(out, "process")
 
     # ── thread engine: the v0.2 default path (gate + AIMD) ───────────────────
@@ -206,6 +224,7 @@ def main(argv=None) -> int:
 
     _write_results(out, args.out)
     _report(out, args, gate, controller)
+    _write_final(out, args.final_out)
     return _exit_code(out, "thread")
 
 
@@ -218,6 +237,13 @@ def _write_results(out, path) -> None:
             error = t.error if hasattr(t, "error") else None
             f.write(json.dumps({"id": tid, "state": state, "result": result,
                                 "error": error}, ensure_ascii=False) + "\n")
+
+
+def _write_final(out, path) -> None:
+    if not path:
+        return
+    from swarm_agent.goal import final_result
+    Path(path).write_text(final_result(out.get("board_results", out["results"])) + "\n")
 
 
 if __name__ == "__main__":

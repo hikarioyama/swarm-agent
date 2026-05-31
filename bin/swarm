@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT="$(readlink -f -- "${BASH_SOURCE[0]}")"
+ROOT="$(cd -- "$(dirname -- "$SCRIPT")/.." && pwd)"
+HERMES_DIR="${HERMES_DIR:-$HOME/.hermes/hermes-agent}"
+PYTHON="${SWARM_PYTHON:-$HERMES_DIR/venv/bin/python}"
+
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PYTHON" -m swarm_agent.cli "$@"

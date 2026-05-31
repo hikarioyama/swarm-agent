@@ -102,13 +102,29 @@ BOARD_PATH = os.environ.get("FLEET_BOARD_PATH") or None
 # `toolset-name-validation`): []=0 tools, todo=1, web=2, file+terminal+search=7, +code_exec=8.
 # Same-role byte-identical prefix => vLLM auto prefix-cache serves it after worker #1.
 TOOL_PROFILES = {
+    # ── front door (persona + memory injected; see compat.make_agent) ──
     "director": ["todo"],                               # holds plan; minimal
     "planner":  ["todo"],                               # decompose; minimal
     "reducer":  [],                                     # pure synthesis of upstream results (0 tools)
     "router":   [],                                     # classify / route only (0 tools)
-    "worker":   ["file", "terminal", "search"],         # default lean coder (~3,328 tok, -77%)
-    "code":     ["file", "terminal", "search", "code_execution"],
-    "research": ["web"],                                # 'web' already supersets web_search (recon)
+    # ── worker swarm (lean, no persona/memory) ──
+    # writer: pure reasoning/explanation/synthesis (0 tools). DEFAULT worker role.
+    "writer":   [],
+    # coder: file edit + shell + code-exec. Deliberately NO `skills` — the bulk
+    # execution lane; a skills index would re-prefill every turn for little gain.
+    "coder":    ["file", "terminal", "search", "code_execution"],
+    # researcher: web + skills. The `skills` toolset (skills_list/skill_view/
+    # skill_manage) is the ONLY switch needed to expose ~/.hermes/skills/ —
+    # system_prompt.py auto-injects the skill index when those tools are present.
+    "researcher": ["web", "skills"],
+    # analyst: read-MOSTLY inspection (read_file/search). No terminal, no code_exec.
+    "analyst":  ["file", "search"],
+    # reviewer: read repo + skills (code-review / security-review skill docs).
+    "reviewer": ["file", "search", "skills"],
+    # ── legacy aliases (KEEP — existing callers/plans still emit these) ──
+    "worker":   ["file", "terminal", "search"],         # default lean coder (back-compat)
+    "code":     ["file", "terminal", "search", "code_execution"],  # alias of coder
+    "research": ["web"],                                # legacy research (no skills)
 }
 
 
@@ -116,17 +132,44 @@ def toolsets_for(lane: str):
     return TOOL_PROFILES.get(lane, TOOL_PROFILES["worker"])
 
 
+# ── Front-door PERSONA lanes ─────────────────────────────────────────────────
+# The user-FACING conversational lanes speak AS the user's HermesAgent persona and
+# benefit from continuity, so they load ~/.hermes/SOUL.md (identity) + ~/.hermes/
+# memories/{MEMORY,USER}.md (persistent memory): the router (chat voice) and the reducer
+# (the final-deliverable voice). The PLANNER is deliberately EXCLUDED — it emits a
+# structured JSON DAG, where a persona prefix only adds latency (memory-store load) and
+# can bias it away from clean JSON. Every worker lane stays lean too, so the ~1.6K-token
+# persona prefix is paid by a couple of agents, never multiplied across the 48-worker
+# bulk. SOUL loads via load_soul_identity=True while skip_context_files stays True, so the
+# harness repo's cwd AGENTS.md/.cursorrules never enter the prefix.
+# Env-overridable (FLEET_PERSONA_LANES="router,reducer"; "" forces the whole fleet lean).
+PERSONA_LANES = set(
+    (os.environ.get("FLEET_PERSONA_LANES", "router,reducer") or "")
+    .replace(" ", "").split(",")
+) - {""}
+
+
+def is_persona_lane(lane: str) -> bool:
+    """True iff `lane` is a front-door conversational lane that gets SOUL+memory."""
+    return lane in PERSONA_LANES
+
+
 # ── Lane priority for the DecodeGate waterfall (#4): higher = served first ────
 # director/planner/reducer get decode slots ahead of the worker swarm so reserved
 # roles never starve behind the bulk. (Per-lane hard reservations are a refinement.)
 LANE_PRIORITY = {
-    "director": 100,
-    "planner":  80,
-    "reducer":  60,
-    "code":     45,
-    "research": 42,
-    "worker":   40,
-    "router":   20,
+    "director":   100,
+    "planner":     80,
+    "reducer":     60,
+    "coder":       45,
+    "code":        45,   # legacy alias of coder
+    "reviewer":    44,
+    "researcher":  42,
+    "research":    42,   # legacy alias
+    "analyst":     41,
+    "worker":      40,
+    "writer":      40,
+    "router":      20,
 }
 
 
