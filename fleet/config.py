@@ -27,3 +27,24 @@ WORKER_MAX_TURNS = int(os.environ.get("FLEET_MAX_TURNS", "12"))
 
 # Per-task retry budget (failed tasks are requeued up to this many times).
 MAX_RETRIES = int(os.environ.get("FLEET_MAX_RETRIES", "1"))
+
+# --- Per-role MINIMAL toolsets (the big lean-worker lever) -------------------
+# Giving every worker all ~39 tools + every MCP server is huge redundant prefill
+# (a smoke run measured ~5K tokens/request, mostly tool schemas) AND makes the
+# model reason over tools it will never use. Each lane loads ONLY what its role
+# needs, via HermesAgent's AIAgent(enabled_toolsets=...). Pure-reasoning roles get
+# NO tools. Keeping the per-role toolset STABLE + identical also lets vLLM
+# prefix-cache the shared prefix across same-role workers (tool prefill paid once).
+TOOL_PROFILES = {
+    "router":   [],                                    # classify / route only
+    "reducer":  [],                                    # synthesize upstream results
+    "planner":  ["todo"],                              # decompose; minimal
+    "worker":   ["file", "terminal"],                  # default general code/file worker
+    "code":     ["file", "terminal", "code_execution"],
+    "web":      ["web", "browser"],
+    "research": ["web", "browser", "vision"],
+}
+
+
+def toolsets_for(lane: str):
+    return TOOL_PROFILES.get(lane, TOOL_PROFILES["worker"])

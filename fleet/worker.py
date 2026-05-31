@@ -43,7 +43,12 @@ def run_task(spec: Dict[str, Any]) -> Dict[str, Any]:
         ctx = "\n\n".join(f"[Result of task {k}]\n{v}" for k, v in deps.items() if v)
         prompt = f"Context from upstream tasks:\n{ctx}\n\n---\nYour task:\n{prompt}"
 
-    agent = AIAgent(base_url=config.BASE_URL, api_key=config.API_KEY, model=config.MODEL)
+    agent = AIAgent(
+        base_url=config.BASE_URL, api_key=config.API_KEY, model=config.MODEL,
+        enabled_toolsets=config.toolsets_for(spec.get("lane", "worker")),  # role-minimal tools
+        skip_context_files=True,   # no SOUL.md/AGENTS.md in the prefix
+        skip_memory=True,          # no persistent-memory injection
+    )
     result = agent.run_conversation(prompt, task_id=spec["id"])
     return {
         "id": spec["id"],
