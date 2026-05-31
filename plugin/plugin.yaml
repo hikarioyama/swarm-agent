@@ -1,0 +1,5 @@
+name: fleet-orchestrator
+version: 0.1.0
+description: "High-concurrency fleet orchestrator for Step-3.7-Flash (stigmergy board + admission-control scheduler). Thin /fleet command over the standalone step37-harness package."
+author: "hikari"
+hooks: []

@@ -1,0 +1,12 @@
+[project]
+name = "step37-harness"
+version = "0.1.0"
+description = "High-concurrency fleet orchestrator for Step-3.7-Flash on top of HermesAgent"
+requires-python = ">=3.10"
+dependencies = []   # uses HermesAgent's venv at runtime (imports run_agent)
+
+[project.scripts]
+fleet = "fleet.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fleet*"]

@@ -1,0 +1,4 @@
+{"id": "t1", "prompt": "In one paragraph, explain what a CPU cache line is and why false sharing hurts performance."}
+{"id": "t2", "prompt": "In one paragraph, explain the difference between TCP and UDP."}
+{"id": "t3", "prompt": "In one paragraph, explain what a bloom filter is and one good use case."}
+{"id": "r1", "prompt": "You are a reducer. Three short technical explanations were produced by earlier workers. Write a 2-sentence summary of what topics were covered (CPU caches, TCP/UDP, bloom filters).", "deps": ["t1", "t2", "t3"], "lane": "reducer"}
