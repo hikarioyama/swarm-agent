@@ -1,8 +1,20 @@
-# step37-harness
+# swarm-agent
 
-A **high-concurrency fleet orchestrator** for Step-3.7-Flash, built **on top of**
-HermesAgent (imports `run_agent.AIAgent`) but living **outside** the HermesAgent
-repo, so `git pull` upstream never touches it.
+A standalone **high-concurrency swarm harness** for Step-3.7-Flash. It reuses
+HermesAgent's `run_agent.AIAgent` as a runtime module but owns its orchestration,
+CLI, board, scheduling, and admission control outside the HermesAgent repo.
+
+The public command is `swarm`. The original `fleet` package remains as the
+measured engine compatibility layer while the goal-driven planner front door is
+built.
+
+Run `swarm` with no arguments to open the Hermes-inspired curses TUI. It can
+launch the small demo, the invaders specialist DAG, or a free-form planner goal
+while showing the live transcript and server metrics. The `❯` composer accepts
+input immediately and sends normal messages through the planner front door.
+Use `/goal TEXT` to save a planner goal without launching it, then `/run` to
+launch it explicitly. Other commands include `/mode invaders`, `/gate 32`,
+`/stop`, and `/help`.
 
 ## Why
 
@@ -63,9 +75,21 @@ plugin/             thin HermesAgent plugin exposing `/fleet` (deploy to ~/.herm
 Use the HermesAgent venv python (so `run_agent` + deps import inside workers):
 ```bash
 cd ~/projects/step37-harness
-/home/hikari/.hermes/hermes-agent/venv/bin/python -m fleet.cli examples/tasks.jsonl --inflight 40
+./bin/swarm examples/tasks.jsonl --inflight 40
 ```
 `tasks.jsonl` — one task per line: `{"id","prompt","deps":[],"lane":"worker"}`.
+
+Or hand one goal to the planner front door:
+```bash
+swarm --goal "Audit this repository and synthesize a report" \
+  --plan-out /tmp/audit-plan.jsonl --final-out /tmp/audit-report.md
+```
+
+Install the local launcher once to run it from any directory:
+```bash
+ln -s ~/projects/step37-harness/bin/swarm ~/.local/bin/swarm
+swarm examples/tasks.jsonl --gate 32 --admission aimd
+```
 
 ## Use the `/fleet` command inside HermesAgent (optional)
 ```bash
