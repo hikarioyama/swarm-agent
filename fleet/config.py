@@ -35,16 +35,45 @@ MAX_RETRIES = int(os.environ.get("FLEET_MAX_RETRIES", "1"))
 # needs, via HermesAgent's AIAgent(enabled_toolsets=...). Pure-reasoning roles get
 # NO tools. Keeping the per-role toolset STABLE + identical also lets vLLM
 # prefix-cache the shared prefix across same-role workers (tool prefill paid once).
+# Token cost of the system+tools prefix per profile is MEASURED on the live server
+# (workflow analysis): default(39 tools)=14,113 tok; coder[file,terminal,search]=3,328
+# (-77%); researcher[web,search]=398 (-97%); reducer[file]=1,459 (-90%). Same-role
+# byte-identical prefix => vLLM auto prefix-cache serves it after worker #1 (~-98%).
 TOOL_PROFILES = {
-    "router":   [],                                    # classify / route only
-    "reducer":  [],                                    # synthesize upstream results
-    "planner":  ["todo"],                              # decompose; minimal
-    "worker":   ["file", "terminal"],                  # default general code/file worker
-    "code":     ["file", "terminal", "code_execution"],
-    "web":      ["web", "browser"],
-    "research": ["web", "browser", "vision"],
+    "director": ["todo"],                               # holds plan; minimal
+    "router":   [],                                     # classify / route only
+    "reducer":  [],                                     # pure synthesis of upstream results
+    "planner":  ["todo"],                               # decompose; minimal
+    "worker":   ["file", "terminal", "search"],         # default coder (~3,328 tok, -77%)
+    "code":     ["file", "terminal", "search", "code_execution"],
+    "research": ["web", "search"],                      # (~398 tok, -97%)
 }
 
 
 def toolsets_for(lane: str):
     return TOOL_PROFILES.get(lane, TOOL_PROFILES["worker"])
+
+
+# --- Agent ROSTER: heterogeneous context / role / count over the KV budget ---
+# The fleet is NOT uniform-context. ONE long-horizon DIRECTOR (big context, steers
+# the whole task via the board, rarely decodes) + a few planners/reducers + the bulk
+# of lean ~8K workers + tiny routers. KV (1,625,950 fp8 tokens) is a shared budget:
+# reserve the few-but-big roles first; the worker lane is the elastic remainder.
+# Provenance of the worker operating point: ~/bench/step37-mtp/FLEET_OPTIMUM.md.
+KV_BUDGET = 1_625_950
+
+ROSTER = {
+    # role:      context  count  tools                                  duty  flags / note
+    "director": dict(context=131072, count=1,  tools=["todo"],                   duty=0.15,
+                     persistent=True,
+                     note="long-horizon steerer; 1 persistent agent holding goal+plan+state, board-driven, OFF the hot loop"),
+    "planner":  dict(context=32768,  count=2,  tools=["todo"],                   duty=0.50,
+                     note="goal -> task DAG; bursty, high value"),
+    "reducer":  dict(context=16384,  count=6,  tools=[],                         duty=0.70,
+                     note="tree fan-in; near-root reducers grow toward larger context"),
+    "worker":   dict(context=8192,   count=48, tools=["file", "terminal", "search"], duty=0.40,
+                     elastic=True,
+                     note="the BULK; ephemeral lean coders, measured C32-64 operating point (count = in-flight target)"),
+    "router":   dict(context=2048,   count=16, tools=[],                         duty=0.20,
+                     note="classify/route; near-free, high churn"),
+}
