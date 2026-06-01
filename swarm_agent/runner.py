@@ -39,6 +39,7 @@ from fleet.board import Board
 from fleet.engine import ThreadFleet
 from fleet.worker import _final_text
 from . import goal as goal_mod
+from .taskstore import TaskStore
 
 
 ROUTER_PROMPT = """You are the front door of a high-concurrency software agent swarm.
@@ -63,8 +64,10 @@ User message:
 {message}
 """
 
-CHAT_PROMPT = """You are a helpful, concise assistant. Reply directly to the user in
-their own language. Plain text, no preamble.
+CHAT_PROMPT = """You are swarm-agent, chatting with Hikari. Be warm, friendly, and
+genuinely helpful — a natural, personable tone, concise but never curt. Speak openly and
+never refuse to talk about how you work. Reply in the user's own language. Plain text,
+no preamble.
 
 Recent conversation (oldest first):
 {history}
@@ -129,6 +132,13 @@ class SwarmRunner:
         self._gate_start = int(gate_start or config.DECODE_GATE_START)
         self._admission = admission
         self._warm = warm
+        self.tasks = TaskStore()
+        self._wake = threading.Event()
+        # The completion manager is CREATED here but only STARTED by start_manager()
+        # (the TUI calls it). Merely constructing a SwarmRunner — e.g. in a test — must
+        # NOT spin up a thread that could dispatch persisted goals against a live server.
+        from .manager import CompletionManager
+        self._manager = CompletionManager(self)
 
     # ── events ────────────────────────────────────────────────────────────────
     def emit(self, kind: str, **kw) -> None:
@@ -168,7 +178,22 @@ class SwarmRunner:
                     f"{config.METRICS_URL}. Start the Step-3.7 endpoint, then retry."))
             self.emit("ready", gate=self.gate.get_limit())
 
+    def start_manager(self) -> None:
+        """Start the completion manager (TUI session only); idempotent.
+
+        Sets the wake event once so any goals PERSISTED from a previous session resume
+        promptly on launch instead of waiting out the first ``interval_s`` heartbeat.
+        """
+        if self._manager is not None:
+            self._manager.start()
+            self._wake.set()
+
     def shutdown(self) -> None:
+        if self._manager is not None:
+            try:
+                self._manager.stop()
+            except Exception:
+                pass
         if self._controller is not None:
             try:
                 self._controller.stop()
@@ -177,7 +202,15 @@ class SwarmRunner:
             self._controller = None
 
     # ── public API ──────────────────────────────────────────────────────────────
-    def submit(self, message: str, force_mode: Optional[str] = None) -> Optional[threading.Thread]:
+    def enqueue_task(self, goal: str) -> dict:
+        """Add a goal to the persistent queue and wake the completion manager."""
+        rec = self.tasks.add(goal)
+        self.emit("queued", goal=goal, queue=self.tasks.counts())
+        self._wake.set()
+        return rec
+
+    def submit(self, message: str, force_mode: Optional[str] = None,
+               record=None) -> Optional[threading.Thread]:
         """Run one user turn on a background daemon thread; returns it (None if busy).
 
         R1 (TOCTOU): claim the busy flag SYNCHRONOUSLY here under a non-blocking lock
@@ -189,21 +222,29 @@ class SwarmRunner:
             if self.busy:
                 return None
             self.busy = True
-        t = threading.Thread(target=self._run_turn, args=(message, force_mode),
+        t = threading.Thread(target=self._run_turn, args=(message, force_mode, record),
                              name="swarm-turn", daemon=True)
         t.start()
         return t
 
     # ── turn execution ───────────────────────────────────────────────────────────
-    def _run_turn(self, message: str, force_mode: Optional[str]) -> None:
+    def _run_turn(self, message: str, force_mode: Optional[str], record=None) -> None:
         # R1: busy already claimed in submit(); here we only clear it (finally).
         with self._run_lock:
+            if record is not None:
+                self.tasks.mark_running(record["id"])
             self.emit("user", text=message)
             self._append_history("user", message)
             try:
                 if not self._setup_done:
                     self.setup()
-                if force_mode == "swarm":
+                if record is not None:
+                    ok, out = self._run_swarm(message)
+                    if ok:
+                        self.tasks.complete(record["id"], out)
+                    else:
+                        self.tasks.fail(record["id"], out)
+                elif force_mode == "swarm":
                     self._run_swarm(message)
                 elif force_mode == "chat":
                     self._record_reply(self._chat(message))
@@ -218,16 +259,26 @@ class SwarmRunner:
                     else:
                         self._record_reply(reply)
             except self._ServerDown as e:                # R2: typed server-down error
+                if record is not None:
+                    # An unreachable server is an INFRA failure, not a task failure —
+                    # do NOT burn the attempt budget (which would permanently fail the
+                    # goal after a few transient outages, defeating "always complete").
+                    # Requeue it; the manager only re-dispatches once the server is back
+                    # (it probes before dispatch), so this never tight-loops.
+                    self.tasks.requeue(record["id"])
                 self.emit("error", text=(
                     "inference server unreachable / API failed — "
                     f"{e}. Check the Step-3.7 endpoint and retry."))
             except Exception as e:                       # never crash the front door
+                if record is not None:
+                    self.tasks.fail(record["id"], str(e))
                 self.emit("error", text=f"{type(e).__name__}: {e}",
                           detail=traceback.format_exc())
             finally:
                 with self._busy_lock:                    # R1: clear under the same guard
                     self.busy = False
                 self.emit("idle")
+                self._wake.set()
 
     def _record_reply(self, text: str) -> None:
         text = (text or "").strip() or "…"
@@ -284,7 +335,7 @@ class SwarmRunner:
         return self._run_agent("router", prompt, "chat", max_iterations=1, max_tokens=2048)
 
     # ── swarm: plan → board → ThreadFleet → final deliverable ────────────────────
-    def _run_swarm(self, goal_text: str) -> None:
+    def _run_swarm(self, goal_text: str) -> tuple[bool, str]:
         self.emit("planning")
         try:
             tasks = self._plan(goal_text)
@@ -296,7 +347,7 @@ class SwarmRunner:
             self.emit("error", text=(
                 "couldn't turn that into a task plan — try rephrasing, narrowing it, "
                 "or use /chat for a direct answer."), detail=f"plan parse failed: {e}")
-            return
+            return (False, "plan parse failed")
         self.emit("planned", n=len(tasks), tasks=[
             {"id": t.id, "lane": t.lane, "deps": list(t.deps), "prompt": t.prompt[:160]}
             for t in tasks
@@ -322,6 +373,7 @@ class SwarmRunner:
         if final and final.strip():
             self.emit("final", text=final, stats=stats)
             self._append_history("assistant", final)
+            return (True, final)
         else:
             # Reducer failed / produced nothing — surface a clean error, never an
             # empty assistant bubble (which read as "no response came back").
@@ -329,6 +381,7 @@ class SwarmRunner:
                 "swarm produced no final deliverable "
                 f"(done={counts.get('done')}, failed={counts.get('failed')}, "
                 f"unfinished={out.get('unfinished')})"), stats=stats)
+            return (False, "swarm produced no final deliverable")
 
     def _plan(self, goal_text: str):
         text = self._run_agent("planner",

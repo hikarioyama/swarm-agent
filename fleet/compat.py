@@ -382,6 +382,32 @@ def _hermes_sandbox_api():
         return None, None
 
 
+def _noninteractive_approval(command, description="", *, allow_permanent=True):
+    """Return a dangerous-command approval decision without reading worker stdin.
+
+    Worker threads have no TTY, so the only non-blocking choices are auto-approve or
+    auto-deny. DEFAULT = auto-approve ("once"): a DELIBERATE autonomy choice so the
+    completion manager can run goals to done unattended (the project's "always finish
+    the task" requirement). The tradeoff is that dangerous commands (rm -rf, sudo,
+    destructive/SSH) from a mistaken or prompt-injected worker also run unconfirmed.
+    Set FLEET_AUTO_APPROVE=0 (or "deny") to flip the default to deny — benign file
+    reads/commands still work; only guard-flagged dangerous commands are blocked.
+    Read at call time so the env can be toggled without reimporting."""
+    enabled = os.environ.get("FLEET_AUTO_APPROVE", "1") not in (
+        "0", "false", "False", "deny")
+    return "once" if enabled else "deny"
+
+
+def install_noninteractive_approval() -> None:
+    """Register the non-interactive approval callback in this worker thread."""
+    try:
+        _ensure_hermes_on_path()
+        from tools.terminal_tool import set_approval_callback
+        set_approval_callback(_noninteractive_approval)
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def worker_sandbox(task_id: str):
     """Give the worker whose tool calls run under ``task_id`` its OWN isolated cwd/bash.
@@ -466,6 +492,7 @@ def make_agent(lane: str, *, base_url: str = None, api_key: str = None, model: s
         set_current_session_id(sid)
     except Exception:
         pass
+    install_noninteractive_approval()
 
     # FIX #7: resolve max_tokens defensively (config.MAX_TOKENS is authored by the
     # config agent; tolerate its absence on older trees → None = model default).
@@ -479,6 +506,12 @@ def make_agent(lane: str, *, base_url: str = None, api_key: str = None, model: s
         _persona = config.is_persona_lane(lane)
     except Exception:
         _persona = False
+
+    try:
+        from . import prompts as _prompts
+        _eph = _prompts.lane_system_prompt(lane)
+    except Exception:
+        _eph = None
 
     agent = AIAgent(
         base_url=base_url or config.BASE_URL,
@@ -499,6 +532,7 @@ def make_agent(lane: str, *, base_url: str = None, api_key: str = None, model: s
         tool_delay=0.0,                                 # FIX #4: kill the default 1.0s inter-tool sleep
         max_tokens=mt,                                  # FIX #7: bounded-generation cap (None=default)
         session_id=sid,                                 # TS1: unique sandbox/cwd/registry
+        ephemeral_system_prompt=_eph,
     )
     agent._fleet_lane = lane                            # read by DecodeGate.acquire
     agent._fleet_decode_s = 0.0

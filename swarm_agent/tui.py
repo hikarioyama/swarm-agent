@@ -16,7 +16,6 @@ import curses
 import os
 import queue
 import sys
-import textwrap
 import time
 import unicodedata
 from pathlib import Path
@@ -37,6 +36,12 @@ HELP = [
     "plain message   router auto-decides: chat reply vs swarm fan-out",
     "/swarm GOAL     force the swarm to decompose GOAL into a parallel DAG",
     "/chat  MSG      force one direct single-agent reply",
+    "/task GOAL      queue a goal; the completion manager runs it to done",
+    "/tasks          list the persistent task queue",
+    "mouse drag      select chat text and copy it (the status panel is left alone)",
+    "/copy [last]    also copy the conversation (or last reply) to the clipboard",
+    "Ctrl+Y          copy the last reply to the clipboard",
+    "↑↓ PgUp PgDn    scroll the conversation (Home/End jump to oldest/newest)",
     "/clear          clear the conversation",
     "/gate N         set the decode-gate floor (throughput)",
     "/help           show this help",
@@ -44,6 +49,22 @@ HELP = [
     "no mid-run stop — a turn runs to completion; Ctrl+D ends the session",
 ]
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class _EOFStdin:
+    """A stdin replacement that is always at EOF.
+
+    Any tool that falls back to input()/sys.stdin.readline() on a worker thread
+    (approval prompts, clarify, oauth) gets an immediate EOF instead of fighting
+    curses for the real terminal or blocking on the 60s approval-join timeout.
+    """
+    def read(self, *a): return ""
+    def readline(self, *a): return ""
+    def readlines(self, *a): return []
+    def __iter__(self): return iter(())
+    def isatty(self): return False
+    def fileno(self): raise OSError("stdin disabled in swarm TUI")
+    def close(self): pass
 
 
 def parse_command(text: str) -> tuple[str, str]:
@@ -54,9 +75,125 @@ def parse_command(text: str) -> tuple[str, str]:
     return command.lower(), argument.strip()
 
 
+def _copy_to_clipboard(text: str) -> str:
+    """Put ``text`` on the system clipboard; return the method used ("" on failure).
+
+    Tries Wayland (wl-copy — the user's Hyprland setup), then X11 (xclip/xsel), then an
+    OSC 52 escape written to /dev/tty (works over SSH and in terminals that support it,
+    where no clipboard CLI is reachable). The subprocess stdin never touches the curses
+    screen; OSC 52 is a non-rendering control string so it does not corrupt the display.
+    """
+    import shutil
+    import subprocess
+    for tool, cmd in (("wl-copy", ["wl-copy"]),
+                      ("xclip", ["xclip", "-selection", "clipboard"]),
+                      ("xsel", ["xsel", "-ib"])):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode(), timeout=2, check=True)
+                return tool
+            except Exception:
+                pass
+    try:
+        import base64
+        seq = "\033]52;c;" + base64.b64encode(text.encode()).decode() + "\a"
+        with open("/dev/tty", "w") as tty:
+            tty.write(seq)
+            tty.flush()
+        return "osc52"
+    except Exception:
+        return ""
+
+
+def _chat_plaintext(blocks, last_only: bool = False) -> str:
+    """Serialise CHAT blocks to plain text (status-panel content is never here).
+
+    ``last_only`` → just the most recent assistant reply. Otherwise the whole
+    conversation: user turns prefixed ``> ``, assistant/error verbatim; transient
+    ``status`` lines (UI chrome) are dropped so a copy is clean conversation text."""
+    if last_only:
+        for kind, text in reversed(blocks):
+            if kind == "assistant":
+                return text
+        return ""
+    out: list[str] = []
+    for kind, text in blocks:
+        if kind == "user":
+            out.append(f"> {text}")
+        elif kind in ("assistant", "error"):
+            out.append(text)
+    return "\n\n".join(out)
+
+
 def _disp_width(text: str) -> int:
     """Terminal display width: East-Asian Wide/Fullwidth glyphs occupy 2 cells."""
     return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _fit(text: str, width: int) -> str:
+    """Truncate ``text`` to at most ``width`` display cells (CJK-safe)."""
+    if width <= 0:
+        return ""
+    out, used = [], 0
+    for ch in text:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + cw > width:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out)
+
+
+def _hard_break(token: str, width: int) -> list[str]:
+    """Split one space-less token into pieces of at most ``width`` cells."""
+    pieces, cur, cur_w = [], "", 0
+    for ch in token:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if cur and cur_w + cw > width:
+            pieces.append(cur)
+            cur, cur_w = "", 0
+        cur += ch
+        cur_w += cw
+    if cur:
+        pieces.append(cur)
+    return pieces or [""]
+
+
+def _wrap_cells(text: str, width: int) -> list[str]:
+    """Word-wrap ``text`` to at most ``width`` DISPLAY cells per line.
+
+    Unlike ``textwrap`` (which counts characters), this measures East-Asian width,
+    so Japanese/CJK lines — 2 cells per glyph and usually space-less — wrap at the
+    pane edge instead of bleeding across the divider into the right panel. Over-long
+    space-less runs (CJK, URLs) are hard-broken by cell count.
+    """
+    width = max(1, width)
+    lines: list[str] = []
+    for para in text.split("\n"):
+        if not para.strip():
+            lines.append("")
+            continue
+        cur, cur_w = "", 0
+        for word in para.split():
+            ww = _disp_width(word)
+            if ww > width:                      # token wider than a whole line
+                if cur:
+                    lines.append(cur)
+                    cur, cur_w = "", 0
+                pieces = _hard_break(word, width)
+                lines.extend(pieces[:-1])
+                cur, cur_w = pieces[-1], _disp_width(pieces[-1])
+            elif not cur:
+                cur, cur_w = word, ww
+            elif cur_w + 1 + ww <= width:
+                cur += " " + word
+                cur_w += 1 + ww
+            else:
+                lines.append(cur)
+                cur, cur_w = word, ww
+        if cur or not lines:
+            lines.append(cur)
+    return lines or [""]
 
 
 # ── curses helpers ────────────────────────────────────────────────────────────
@@ -85,6 +222,7 @@ def _palette() -> dict:
         "fg":   _pair(5),
         "dim":  _pair(0, curses.A_DIM),
         "warn": _pair(1),
+        "head": _pair(5, curses.A_BOLD),   # section headers in the right panel
     }
 
 
@@ -109,14 +247,10 @@ class ChatLog:
 
     @staticmethod
     def _wrap(text: str, width: int) -> list[str]:
-        out: list[str] = []
-        for para in text.split("\n"):
-            out.extend(textwrap.wrap(para, width) if para.strip() else [""])
-        return out or [""]
+        return _wrap_cells(text, width)
 
-    def render(self, add, geom, palette) -> None:
-        top, left, bottom, right = geom
-        width = max(10, right - left)
+    def _all_lines(self, width: int) -> list[tuple[str, str]]:
+        """Wrap every block into the full ordered list of (text, palette-key) lines."""
         lines: list[tuple[str, str]] = []
         for kind, text in self.blocks:
             key, first, cont = self._STYLE.get(kind, ("fg", "  ", "  "))
@@ -124,11 +258,29 @@ class ChatLog:
                 lines.append(((first if j == 0 else cont) + seg, key))
             if kind in ("assistant", "error"):
                 lines.append(("", "dim"))
-        rows = max(1, bottom - top)
+        return lines
+
+    def render(self, add, geom, palette, scroll: int = 0) -> int:
+        """Paint the conversation; ``scroll`` = lines held back from the bottom.
+
+        Returns the maximum valid scroll (so the caller can clamp its own state). With
+        ``scroll == 0`` the newest line is pinned to the bottom (terminal-style follow);
+        a positive ``scroll`` reveals earlier lines — how the user reads a reply whose
+        top scrolled off. ``scroll`` is clamped here so it can never blank the pane.
+        """
+        top, left, bottom, right = geom
+        width = max(10, right - left)
+        lines = self._all_lines(width)
+        rows = max(1, bottom - top + 1)
+        max_scroll = max(0, len(lines) - rows)
+        scroll = max(0, min(scroll, max_scroll))
+        end = len(lines) - scroll
+        start = max(0, end - rows)
         y = top
-        for text, key in lines[-rows:]:
-            add(y, left, text[:width], palette.get(key, 0))
+        for text, key in lines[start:end]:
+            add(y, left, _fit(text, width), palette.get(key, 0))
             y += 1
+        return max_scroll
 
 
 class App:
@@ -150,6 +302,8 @@ class App:
         self._tick = 0
         self.phase = ""
         self._task_total = 0
+        self.scroll = 0           # conversation scroll: lines held back from the bottom
+        self._max_scroll = 0      # last render's clamp ceiling (updated every draw)
         self.pending: list = []   # messages queued while a turn is running
         self._log = None
         self._orig_io = None
@@ -158,12 +312,13 @@ class App:
     def _redirect_output(self) -> None:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         self._log = open(LOG_PATH, "a", buffering=1)
-        self._orig_io = (sys.stdout, sys.stderr)
+        self._orig_io = (sys.stdout, sys.stderr, sys.stdin)
         sys.stdout = sys.stderr = self._log
+        sys.stdin = _EOFStdin()
 
     def _restore_output(self) -> None:
         if self._orig_io:
-            sys.stdout, sys.stderr = self._orig_io
+            sys.stdout, sys.stderr, sys.stdin = self._orig_io
         if self._log:
             try:
                 self._log.close()
@@ -184,6 +339,7 @@ class App:
                 self.started_at = time.monotonic()
                 self.message = "working…"
                 self.phase = "thinking"
+                self.scroll = 0          # a new turn snaps the view back to the live tail
             elif kind == "boot":
                 self.phase = "warming runtime"
             elif kind == "ready":
@@ -193,6 +349,11 @@ class App:
             elif kind == "status":
                 # R4: front-door status lines (e.g. 'router unsure — routing to the swarm').
                 self.chat.add("status", ev.get("text", ""))
+            elif kind == "queued":
+                q = ev.get("queue") or {}
+                self.chat.add("status", f"queued → task added ({q.get('pending', 0)} pending)")
+            elif kind == "manager":
+                self.chat.add("status", f"manager · {ev.get('text', '')}")
             elif kind == "route":
                 if ev.get("mode") == "swarm":
                     self.phase = "planning"
@@ -254,12 +415,36 @@ class App:
             self._dispatch(argument, "swarm")
         elif command == "chat":
             self._dispatch(argument, "chat")
+        elif command == "task":
+            if not argument:
+                self.message = "usage: /task GOAL"
+            else:
+                self.runner.enqueue_task(argument)
+                self.message = (
+                    f"queued · {self.runner.tasks.counts()['pending']} pending in task queue")
+        elif command == "tasks":
+            snapshot = self.runner.tasks.snapshot()
+            if not snapshot:
+                self.chat.add("status", "task queue is empty")
+            else:
+                q = self.runner.tasks.counts()
+                self.chat.add("status", (
+                    f"task queue · {q['pending']} pending · {q['running']} running · "
+                    f"{q['done']} done · {q['failed']} failed"))
+                for rec in snapshot:
+                    self.chat.add(
+                        "status", f"[{rec['state']}] {rec['id']} · {rec['goal'][:60]}")
         elif command == "clear":
             self.chat.clear()
             self.swarm = SwarmView()
+            self.scroll = 0
             self.message = "cleared"
         elif command == "gate":
             self._set_gate(argument)
+        elif command == "copy":
+            # Copy the CHAT pane only (the live status panel is never copied). No arg /
+            # "all" → whole conversation; "last"/"answer"/"reply" → just the last reply.
+            self._copy(last_only=argument.strip().lower() in {"last", "answer", "reply"})
         else:
             self.message = f"unknown command: /{command}"
         return True
@@ -281,6 +466,17 @@ class App:
         if self.pending and not self.runner.busy:
             text, force_mode = self.pending.pop(0)
             self.runner.submit(text, force_mode=force_mode)
+
+    # ── clipboard: copy the CHAT pane (never the status panel) ───────────────────
+    def _copy(self, last_only: bool) -> None:
+        text = _chat_plaintext(self.chat.blocks, last_only=last_only)
+        if not text.strip():
+            self.message = "nothing to copy yet"
+            return
+        method = _copy_to_clipboard(text)
+        what = "last reply" if last_only else "conversation"
+        self.message = (f"copied {what} to clipboard ({method})" if method
+                        else "no clipboard tool — install wl-clipboard or xclip")
 
     def _set_gate(self, argument: str) -> None:
         try:
@@ -321,21 +517,30 @@ class App:
     def draw(self) -> None:
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
+        comp_w = max(1, w - 4)
+        input_lines = _hard_break(self.input, comp_w)
+        if self.input and _disp_width(input_lines[-1]) >= comp_w:
+            input_lines.append("")
+        max_comp_rows = max(1, min(8, h - 6))
+        comp_lines = input_lines[-max_comp_rows:]
+        n_comp = len(comp_lines)
         pal = _palette()
         self._tick += 1
         busy = self.runner.busy
         gate = self.runner.gate.get_limit() if self.runner.gate is not None else config.DECODE_GATE_START
         running = int(self._sc.get("running", 0)) if self._sc else 0
         kv = f"{self._sc.get('kv', 0) * 100:.0f}%" if self._sc else "?"
+        elapsed = int(time.monotonic() - self.started_at) if self.started_at else 0
 
         # header (1 line)
         self._safe(0, 1, "swarm-agent", pal["gold"])
         self._safe(0, 13, f"· {config.MODEL} · high-concurrency Hermes runtime", pal["dim"])
 
-        body_top, body_bottom = 2, h - 4
-        divider = max(28, int(w * 0.58))
-        # vertical divider
-        for y in range(body_top, body_bottom):
+        body_top, body_bottom = 2, h - 3 - n_comp
+        # right pane = the status panel, pinned to the right 1/3 of the screen.
+        divider = max(28, (w * 2) // 3)
+        # vertical divider (full panel height, incl. the bottom metrics row)
+        for y in range(body_top, body_bottom + 1):
             self._safe(y, divider, "│", pal["dim"])
 
         # left: conversation (or welcome); reserve the bottom row for a live spinner
@@ -349,40 +554,64 @@ class App:
         elif not self.chat.blocks:
             self._welcome((body_top, 2, body_bottom, divider - 1), pal)
         else:
-            self.chat.render(self._safe, chat_geom, pal)
+            self._max_scroll = self.chat.render(self._safe, chat_geom, pal, self.scroll)
+            if self.scroll > self._max_scroll:
+                self.scroll = self._max_scroll
         if busy and not self.show_help:
             spin = _SPIN[self._tick % len(_SPIN)]
             el = int(time.monotonic() - self.started_at) if self.started_at else 0
             self._safe(body_bottom, 2, f"{spin} {self.phase or 'working'}… {el}s"[:divider - 3],
                        pal["run"])
 
-        # right: live swarm dashboard
+        # right: live swarm dashboard (now the single status panel). Pass the runner's
+        # busy/phase so the WORKERS list shows the front-door "main" worker animating
+        # even for a chat reply that spawns no fleet.
         self.swarm.render(self._safe, (body_top, divider + 2, body_bottom, w - 2),
                           palette=pal, gate_limit=gate, running=running,
-                          kv_pct=kv, tok_s=self._tok_s)
+                          kv_pct=kv, tok_s=self._tok_s, elapsed=elapsed,
+                          busy=busy, phase=self.phase, queue=self.runner.tasks.counts())
 
-        # status line + composer
-        elapsed = int(time.monotonic() - self.started_at) if self.started_at else 0
-        status = f"{self.phase or 'working'}…" if busy else self.message
-        rule = (f"─ {status} │ gate {gate} │ running {running} │ kv {kv} │ "
-                f"{self._tok_s:.0f} tok/s │ {elapsed}s ")
-        self._safe(h - 3, 1, rule + "─" * max(0, w - len(rule) - 2), pal["dim"])
-        self._safe(h - 2, 1, "❯ ", pal["gold"])
+        # composer — a plain rule frames it; ALL status now lives in the right panel.
+        rule_y = h - 2 - n_comp
+        comp_top = h - 1 - n_comp
+        self._safe(rule_y, 1, "─" * max(0, w - 2), pal["dim"])
+        self._safe(comp_top, 1, "❯ ", pal["gold"])
         if self.input:
-            self._safe(h - 2, 3, self.input, pal["fg"])
+            for i, seg in enumerate(comp_lines):
+                self._safe(comp_top + i, 3, _fit(seg, comp_w), pal["fg"])
+        elif self.scroll > 0:
+            # Scrolled up to read history — say so, and how to get back to the live tail.
+            self._safe(comp_top, 3, _fit(
+                f"⇡ scrolled {self.scroll} line(s) up · ↓/End to follow the latest",
+                comp_w), pal["warn"])
         else:
+            # Keep transient command feedback (queued / cleared / gate …) visible here,
+            # since the status rule that used to show self.message is gone.
             hint = ("working… no mid-run stop · Ctrl+D ends the session"
-                    if busy else "Type a goal or /help")
-            self._safe(h - 2, 3, hint, pal["dim"])
+                    if busy else (self.message or "Type a goal or /help"))
+            self._safe(comp_top, 3, _fit(hint, comp_w), pal["dim"])
         self._safe(h - 1, 1,
-                   "Enter send · /swarm · /chat · /clear · /help · Ctrl+D quit", pal["dim"])
+                   "Enter send · ↑↓ scroll · drag to select & copy · /help · Ctrl+D quit",
+                   pal["dim"])
         try:
             curses.curs_set(1)
             # T3: position the cursor by DISPLAY width, not len(); CJK glyphs are 2 cells.
-            self.stdscr.move(h - 2, min(w - 2, 3 + _disp_width(self.input)))
+            cur_y = comp_top + n_comp - 1
+            cur_x = min(w - 2, 3 + _disp_width(comp_lines[-1]))
+            self.stdscr.move(cur_y, cur_x)
         except curses.error:
             pass
         self.stdscr.refresh()
+
+    # ── scrolling ──────────────────────────────────────────────────────────────
+    def _page(self) -> int:
+        """Lines to move per PageUp/PageDown (≈ one chat-pane height)."""
+        h, _ = self.stdscr.getmaxyx()
+        return max(1, (h - 4) - 2 - 1)
+
+    def _scroll_by(self, delta: int) -> None:
+        """delta>0 = older (up), delta<0 = newer (down). Clamped to the live tail."""
+        self.scroll = max(0, min(self._max_scroll, self.scroll + delta))
 
     def _welcome(self, geom, pal) -> None:
         top, left, bottom, right = geom
@@ -411,8 +640,20 @@ class App:
                 curses.curs_set(1)
             except curses.error:
                 pass
+            # Leave the mouse to the TERMINAL — do NOT enable curses mouse reporting.
+            # With reporting OFF, click-drag works natively, so the user can select and
+            # COPY chat text with the mouse the normal way. (Capturing the mouse for
+            # wheel-scroll would suppress that native selection.) Scroll with the keyboard
+            # instead: ↑↓ / PgUp / PgDn / Home / End; the view also follows the live tail.
+            try:
+                curses.mousemask(0)
+            except (curses.error, AttributeError):
+                pass
             self.stdscr.nodelay(True)
             self.stdscr.timeout(100)
+            # Only NOW (inside a real TUI session) start the completion manager, so it
+            # can resume any goals persisted from a previous session and drive the queue.
+            self.runner.start_manager()
             while True:
                 self.pump()
                 self._scrape()
@@ -437,6 +678,20 @@ class App:
                     self.input = self.input[:-1]
                 elif key == "\x15":                      # Ctrl+U
                     self.input = ""
+                elif key == "\x19":                      # Ctrl+Y → copy last reply
+                    self._copy(last_only=True)
+                elif key == curses.KEY_UP:               # scroll conversation: older
+                    self._scroll_by(1)
+                elif key == curses.KEY_DOWN:             # scroll: newer / follow
+                    self._scroll_by(-1)
+                elif key == curses.KEY_PPAGE:            # PageUp
+                    self._scroll_by(self._page())
+                elif key == curses.KEY_NPAGE:            # PageDown
+                    self._scroll_by(-self._page())
+                elif key == curses.KEY_HOME:             # jump to the oldest line
+                    self.scroll = self._max_scroll
+                elif key == curses.KEY_END:              # jump back to the live tail
+                    self.scroll = 0
                 elif isinstance(key, str) and key.isprintable():
                     self.input += key
         finally:

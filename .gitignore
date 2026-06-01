@@ -5,6 +5,7 @@ fleet_results*.jsonl
 /tmp/
 examples/sweep_8k.jsonl
 results/live_sweep.json
+results/swarm-validation/
 *.db
 *.db-wal
 *.db-shm

@@ -8,9 +8,11 @@ parsing, bounded history, and the busy admission guard.
 
 from __future__ import annotations
 
-from swarm_agent.tui import parse_command, _disp_width, ChatLog
+from fleet import compat, prompts
+from swarm_agent.tui import parse_command, _disp_width, _hard_break, ChatLog
 from swarm_agent.dashboard import SwarmView, _GLYPH
 from swarm_agent.runner import SwarmRunner, _parse_route, _HISTORY_CAP
+from swarm_agent.taskstore import TaskStore
 
 
 # ── command parsing ───────────────────────────────────────────────────────────
@@ -26,6 +28,14 @@ def test_disp_width_counts_wide_glyphs_as_two() -> None:
     assert _disp_width("abc") == 3
     assert _disp_width("あい") == 4            # 2 wide glyphs → 4 cells
     assert _disp_width("aテスト") == 1 + 6      # ascii + 3 wide
+
+
+def test_composer_hard_break_keeps_ascii_and_cjk_inside_width() -> None:
+    for text, width in (("abcdefghijklmnopqrstuvwxyz", 7), ("長い日本語入力欄", 6)):
+        lines = _hard_break(text, width)
+        assert len(lines) > 1
+        assert "".join(lines) == text
+        assert all(_disp_width(line) <= width for line in lines)
 
 
 # ── chat log wrapping ─────────────────────────────────────────────────────────
@@ -86,6 +96,68 @@ def test_swarmview_render_short_pane_no_crash() -> None:
                  palette=pal, gate_limit=40, running=1, kv_pct="10%", tok_s=100.0)
 
 
+_PAL = {k: 0 for k in ("gold", "ok", "err", "run", "dim", "head", "fg", "warn")}
+
+
+def _render_view(v: SwarmView, *, busy: bool, phase: str = "") -> list[str]:
+    rows: list[str] = []
+    v.render(lambda y, x, t, a=0: rows.append(t), (2, 0, 24, 40),
+             palette=_PAL, gate_limit=40, running=0, kv_pct="1%", tok_s=0.0,
+             busy=busy, phase=phase)
+    return rows
+
+
+def test_workers_show_main_worker_while_busy_without_fleet() -> None:
+    # Chat reply: the runner is busy but no swarm was planned. The WORKERS list must
+    # still show the front-door "main" worker animating (the user's "メインWorker").
+    rows = _render_view(SwarmView(), busy=True, phase="thinking")
+    assert any("WORKERS · 1 active" in r for r in rows)
+    assert any(r.startswith(" main") and "thinking" in r for r in rows)
+    assert any("● live" in r for r in rows)            # badge tracks busy, not just fan-out
+
+
+def test_workers_idle_still_shows_main_worker() -> None:
+    # Even with nothing running, the roster must always show the main worker — now
+    # standing by (idle), never an empty "○ idle" pane. (待機中Workerも常に表示)
+    rows = _render_view(SwarmView(), busy=False)
+    assert any("WORKERS · 0 active" in r for r in rows)
+    assert any(r.startswith(" main") and "idle" in r for r in rows)
+
+
+def test_workers_list_main_plus_running_and_waiting() -> None:
+    v = SwarmView()
+    _seed(v)                                              # a, b, r (reducer) planned
+    v.ingest({"kind": "task", "event": "dispatch", "id": "a", "counts": {"running": 1}})
+    # b stays pending (waiting), r (reducer) stays pending (waiting on a+b)
+    rows = _render_view(v, busy=True, phase="running · 0/3 done")
+    # 2 active (main + a), 2 waiting (b + r)
+    assert any("WORKERS · 2 active · 2 waiting" in r for r in rows)
+    assert any(r.startswith(" main") for r in rows)
+    assert any("a" in r and "writer" in r for r in rows)   # running sub-agent
+    assert any("b" in r and "coder" in r for r in rows)    # waiting sub-agent shown
+
+
+# ── chat-log scroll (arrow keys / wheel) ──────────────────────────────────────
+def test_chatlog_scroll_reveals_older_and_clamps() -> None:
+    log = ChatLog()
+    log.add("user", "q")
+    log.add("assistant", "\n".join(f"L{i:02d}" for i in range(30)))
+    pal = {k: 0 for k in ("gold", "fg", "dim", "err")}
+
+    def view(scroll: int):
+        rows: list[str] = []
+        mx = log.render(lambda y, x, t, a=0: rows.append(t), (0, 0, 9, 40), pal, scroll)
+        return mx, [r for r in rows if r.strip()]
+
+    max_scroll, tail = view(0)
+    assert max_scroll > 0
+    assert any("L29" in r for r in tail)               # scroll=0 pins newest at bottom
+    _, older = view(max_scroll)                        # fully scrolled up
+    assert any("q" in r for r in older)                # reveals the oldest line (user msg)
+    over, _ = view(10_000)                             # over-scroll clamps, never blanks
+    assert over == max_scroll
+
+
 # ── runner: router parsing, bounded history, busy admission guard ─────────────
 def test_parse_route_tolerates_prose_and_rejects_nondict() -> None:
     assert _parse_route('{"mode":"swarm"}') == {"mode": "swarm"}
@@ -105,3 +177,103 @@ def test_busy_guard_rejects_reentry() -> None:
     r = SwarmRunner()
     r.busy = True                                    # simulate an in-flight turn
     assert r.submit("second message") is None        # R1: rejected, no thread spawned
+    r.shutdown()
+
+
+# ── persistent completion queue ───────────────────────────────────────────────
+def test_taskstore_transitions_persistence_and_running_recovery(tmp_path) -> None:
+    path = tmp_path / "tasks.json"
+    store = TaskStore(str(path), max_attempts=2)
+    first = store.add("finish the feature")
+    assert store.next_pending() == first
+    assert store.counts() == {
+        "pending": 1, "running": 0, "done": 0, "failed": 0, "total": 1}
+    assert store.has_unfinished()
+
+    store.mark_running(first["id"])
+    assert store.counts()["running"] == 1
+    recovered = TaskStore(str(path), max_attempts=2)
+    assert recovered.snapshot()[0]["state"] == "pending"
+    assert recovered.snapshot()[0]["started_at"] is None
+
+    recovered.mark_running(first["id"])
+    recovered.complete(first["id"], "done")
+    assert recovered.snapshot()[0]["result"] == "done"
+    assert not recovered.has_unfinished()
+
+    retry = recovered.add("retry me")
+    assert recovered.fail(retry["id"], "first error") == "pending"
+    assert recovered.snapshot()[1]["attempts"] == 1
+    assert recovered.fail(retry["id"], "second error") == "failed"
+    assert recovered.counts() == {
+        "pending": 0, "running": 0, "done": 1, "failed": 1, "total": 2}
+    reloaded = TaskStore(str(path), max_attempts=2)
+    assert reloaded.snapshot() == recovered.snapshot()
+
+
+def test_noninteractive_approval_defaults_once_and_can_deny(monkeypatch) -> None:
+    monkeypatch.delenv("FLEET_AUTO_APPROVE", raising=False)
+    assert compat._noninteractive_approval("rm -rf /", "x") == "once"
+    monkeypatch.setenv("FLEET_AUTO_APPROVE", "0")
+    assert compat._noninteractive_approval("rm -rf /", "x") == "deny"
+
+
+# ── per-lane ephemeral system prompts ─────────────────────────────────────────
+def test_coder_system_prompt_has_identity_and_worker_framing() -> None:
+    prompt = prompts.lane_system_prompt("coder")
+    assert "swarm-agent" in prompt
+    assert "Hikari" in prompt
+    assert "WRITE" in prompt
+    # swarm framing: other workers are parts of the same self, one mind
+    assert "single mind" in prompt
+    assert "other parts of the same swarm-agent" in prompt
+    # The identity must NOT name the underlying framework/vendor (the user's "drop the
+    # HermesAgent/runtime info" requirement) — but it must NOT be cagey/refuse either:
+    # it speaks openly and warmly rather than deflecting "implementation details".
+    assert "Hermes" not in prompt
+    assert "Nous" not in prompt
+    assert "never refuse to discuss how you work" in prompt
+
+
+def test_router_system_prompt_is_identity_only() -> None:
+    assert prompts.lane_system_prompt("router") == prompts.SWARM_IDENTITY
+
+
+def test_reducer_system_prompt_has_identity_and_role() -> None:
+    prompt = prompts.lane_system_prompt("reducer")
+    assert "REINTEGRATES" in prompt
+    assert "swarm-agent" in prompt
+
+
+def test_unknown_lane_system_prompt_uses_worker_framing() -> None:
+    assert "single mind" in prompts.lane_system_prompt("nonsense")
+
+
+def test_swarm_system_prompt_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("FLEET_SWARM_SYSTEM", "0")
+    for lane in ("coder", "router", "reducer", "nonsense"):
+        assert prompts.lane_system_prompt(lane) is None
+
+
+def test_front_door_lanes_are_lean_by_default() -> None:
+    # Persona/memory injection is OFF by default so swarm-agent's own injected identity
+    # is not contaminated by the user's HermesAgent SOUL/memory — which made the live
+    # chat confabulate a wrong "27B main + qwen36 workers via delegate_task" self-image.
+    from fleet import config
+    assert config.PERSONA_LANES == set()
+    assert not config.is_persona_lane("router")
+    assert not config.is_persona_lane("reducer")
+
+
+# ── clipboard: chat is copyable, the status panel is not ──────────────────────
+def test_chat_plaintext_copies_chat_only_not_status() -> None:
+    from swarm_agent.tui import _chat_plaintext
+    blocks = [("user", "hi"), ("assistant", "answer one"),
+              ("status", "queued → task added"), ("assistant", "answer two"),
+              ("error", "boom")]
+    whole = _chat_plaintext(blocks)
+    assert "> hi" in whole
+    assert "answer one" in whole and "answer two" in whole and "boom" in whole
+    assert "queued → task added" not in whole         # status chrome is never copied
+    assert _chat_plaintext(blocks, last_only=True) == "answer two"
+    assert _chat_plaintext([], last_only=True) == ""

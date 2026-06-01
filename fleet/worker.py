@@ -92,6 +92,11 @@ def run_task(spec: Dict[str, Any]) -> Dict[str, Any]:
     if config.HERMES_DIR not in sys.path:
         sys.path.insert(0, config.HERMES_DIR)
     from run_agent import AIAgent  # noqa: E402  (imported in child for env isolation)
+    try:
+        from fleet import compat
+        compat.install_noninteractive_approval()
+    except Exception:
+        pass
 
     t0 = time.time()
     prompt = _build_prompt(spec)
@@ -102,6 +107,12 @@ def run_task(spec: Dict[str, Any]) -> Dict[str, Any]:
     # FIX #7: read the bounded-generation cap defensively (config.MAX_TOKENS authored by
     # the config agent; None = model/server default → AIAgent omits the param).
     max_tokens = getattr(config, "MAX_TOKENS", None)
+
+    try:
+        from fleet import prompts as _prompts
+        _eph = _prompts.lane_system_prompt(spec.get("lane", "worker"))
+    except Exception:
+        _eph = None
 
     agent = AIAgent(
         base_url=config.BASE_URL, api_key=config.API_KEY, model=config.MODEL,
@@ -114,6 +125,7 @@ def run_task(spec: Dict[str, Any]) -> Dict[str, Any]:
         tool_delay=0.0,                 # FIX #4: drop the default 1.0s inter-tool sleep
         max_tokens=max_tokens,          # FIX #7: bounded-generation cap (None=default)
         session_id=sid,                 # TS1: unique sandbox/cwd/registry namespace
+        ephemeral_system_prompt=_eph,
     )
     result = agent.run_conversation(prompt, task_id=spec["id"])
     return _result_dict(spec, result, t0)

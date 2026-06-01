@@ -106,6 +106,7 @@ TOOL_PROFILES = {
     "director": ["todo"],                               # holds plan; minimal
     "planner":  ["todo"],                               # decompose; minimal
     "reducer":  [],                                     # pure synthesis of upstream results (0 tools)
+    "manager":  [],                                     # queue oversight only (0 tools)
     "router":   [],                                     # classify / route only (0 tools)
     # ── worker swarm (lean, no persona/memory) ──
     # writer: pure reasoning/explanation/synthesis (0 tools). DEFAULT worker role.
@@ -133,18 +134,19 @@ def toolsets_for(lane: str):
 
 
 # ── Front-door PERSONA lanes ─────────────────────────────────────────────────
-# The user-FACING conversational lanes speak AS the user's HermesAgent persona and
-# benefit from continuity, so they load ~/.hermes/SOUL.md (identity) + ~/.hermes/
-# memories/{MEMORY,USER}.md (persistent memory): the router (chat voice) and the reducer
-# (the final-deliverable voice). The PLANNER is deliberately EXCLUDED — it emits a
-# structured JSON DAG, where a persona prefix only adds latency (memory-store load) and
-# can bias it away from clean JSON. Every worker lane stays lean too, so the ~1.6K-token
-# persona prefix is paid by a couple of agents, never multiplied across the 48-worker
-# bulk. SOUL loads via load_soul_identity=True while skip_context_files stays True, so the
-# harness repo's cwd AGENTS.md/.cursorrules never enter the prefix.
-# Env-overridable (FLEET_PERSONA_LANES="router,reducer"; "" forces the whole fleet lean).
+# DEFAULT = none. swarm-agent now has its OWN identity, injected per-lane via
+# fleet/prompts.py (SWARM_IDENTITY: "Hikari's hardware-optimised swarm, one mind across
+# many parts"). Loading ~/.hermes/SOUL.md + ~/.hermes/memories/{MEMORY,USER}.md on the
+# front-door lanes ACTIVELY HARMS that: the user's general HermesAgent persona/memory
+# bleeds in and the model confabulates a wrong self-description — observed live, the chat
+# claimed to be "a 27B main model + qwen36-35b-a3b workers via delegate_task" (those are
+# the user's OTHER local-model notes, not swarm-agent's architecture). With persona OFF,
+# the same probe answers cleanly as swarm-agent ("the parallel workers are all me, one
+# mind"). So every lane stays lean and the only identity is the injected SWARM_IDENTITY.
+# Still env-overridable: FLEET_PERSONA_LANES="router,reducer" re-enables SOUL+memory on
+# those lanes (e.g. if you WANT the user's memory woven into final deliverables).
 PERSONA_LANES = set(
-    (os.environ.get("FLEET_PERSONA_LANES", "router,reducer") or "")
+    (os.environ.get("FLEET_PERSONA_LANES", "") or "")
     .replace(" ", "").split(",")
 ) - {""}
 
@@ -161,6 +163,7 @@ LANE_PRIORITY = {
     "director":   100,
     "planner":     80,
     "reducer":     60,
+    "manager":     50,
     "coder":       45,
     "code":        45,   # legacy alias of coder
     "reviewer":    44,

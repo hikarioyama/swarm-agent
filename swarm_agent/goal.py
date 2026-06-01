@@ -123,10 +123,25 @@ Rules of thumb:
   - "Review / audit / find bugs or vulns in existing code" → reviewer.
 When two lanes could work, choose the cheaper one.
 
+Deliverable type — decide this FIRST:
+  - TEXT deliverable (explanation, analysis, report, comparison, plan): use
+    writer/analyst/researcher tasks + a reducer that synthesizes the final text.
+  - FILE-ON-DISK or RUNNABLE deliverable ("write X to a file", "create a script",
+    "build a game/app/tool", "generate a config"): you MUST include a "coder" task that
+    AUTHORS AND WRITES the file(s) to disk, and (when sensible) RUNS a shell check to
+    verify (e.g. the file exists and contains the expected markers). The "reducer" has
+    NO TOOLS — it cannot read, write, or run anything; it only synthesizes text from
+    upstream results, so NEVER expect the reducer to create or save a file. For a single
+    self-contained file, prefer ONE coder task that writes the whole file over many text
+    tasks whose output would have to be re-assembled (re-assembly in the reducer is slow
+    and often truncates large files).
+
 Return ONLY a JSON array. Each item has:
   {{"id":"short-id","prompt":"specific standalone assignment","deps":[],"lane":"writer"}}
 The FINAL item must have lane "reducer", depend on every required upstream task, and
-instruct the reducer to produce the complete integrated deliverable.
+instruct the reducer to produce the complete integrated deliverable — for a FILE/RUNNABLE
+goal the files are written by the coder task(s); the reducer then only reports concisely
+what was built and the verification result (it must not try to write files itself).
 
 User goal:
 {goal}
