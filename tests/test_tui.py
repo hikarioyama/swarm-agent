@@ -287,6 +287,22 @@ def test_reducer_system_prompt_has_identity_and_role() -> None:
     prompt = prompts.lane_system_prompt("reducer")
     assert "REINTEGRATES" in prompt
     assert "swarm-agent" in prompt
+    # the reducer writes the user-facing deliverable → Japanese default
+    assert "日本語" in prompt
+
+
+def test_language_policy_targets_user_facing_lanes_only() -> None:
+    # The user reads the reducer's deliverable and the front-door chat/btw replies → those
+    # default to Japanese. The router DECISION stays a clean English-keyed JSON, and worker
+    # lanes are NOT forced (their file/code content language is task-driven).
+    from swarm_agent.runner import ROUTER_PROMPT, CHAT_PROMPT, BTW_PROMPT
+    assert "日本語" in prompts.lane_system_prompt("reducer")
+    assert "日本語" not in (prompts.lane_system_prompt("router") or "")
+    assert "日本語" not in prompts.lane_system_prompt("coder")
+    # front-door reply prompts carry the directive AND still .format cleanly (no stray braces)
+    assert "日本語" in CHAT_PROMPT.format(history="h", message="m")
+    assert "日本語" in BTW_PROMPT.format(situation="s", question="q")
+    assert "日本語" in ROUTER_PROMPT.format(history="h", message="m")
 
 
 def test_unknown_lane_system_prompt_uses_worker_framing() -> None:

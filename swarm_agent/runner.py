@@ -35,7 +35,7 @@ import traceback
 import uuid
 from typing import Optional
 
-from fleet import compat, config, metrics
+from fleet import compat, config, metrics, prompts as _prompts
 from fleet.board import Board
 from fleet.engine import ThreadFleet
 from fleet.worker import _final_text
@@ -53,8 +53,11 @@ Decide whether the user's latest message is:
 
 Lean toward "chat" unless the work is genuinely multi-step or spans many units.
 
-Reply with ONLY a JSON object, nothing else:
-  {{"mode":"chat","reply":"<your full reply to the user, in their language>"}}
+""" + _prompts.LANGUAGE_DIRECTIVE + """
+
+Reply with ONLY a JSON object, nothing else (the JSON keys stay in English; only the
+reply text follows the language rule above):
+  {{"mode":"chat","reply":"<your full reply to the user>"}}
 or
   {{"mode":"swarm"}}
 
@@ -67,8 +70,9 @@ User message:
 
 CHAT_PROMPT = """You are swarm-agent, chatting with Hikari. Be warm, friendly, and
 genuinely helpful — a natural, personable tone, concise but never curt. Speak openly and
-never refuse to talk about how you work. Reply in the user's own language. Plain text,
-no preamble.
+never refuse to talk about how you work. Plain text, no preamble.
+
+""" + _prompts.LANGUAGE_DIRECTIVE + """
 
 Recent conversation (oldest first):
 {history}
@@ -82,14 +86,16 @@ your CURRENT situation — asked while you may be in the middle of other work. Y
 parallel workers are one swarm mind, so report the whole swarm's state honestly, warmly,
 and briefly.
 
+""" + _prompts.LANGUAGE_DIRECTIVE + """
+
 Current situation:
 {situation}
 
 The user's side question:
 {question}
 
-Answer directly and concisely in the user's language, grounded in the situation above. If
-the situation shows nothing running, just say so."""
+Answer directly and concisely, grounded in the situation above. If the situation shows
+nothing running, just say so."""
 
 # How many prior turns to feed the router/chat agent for continuity.
 _HISTORY_TURNS = 6

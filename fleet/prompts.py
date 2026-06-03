@@ -20,6 +20,17 @@ from __future__ import annotations
 import os
 
 
+# Language policy for everything the user actually READS (the reducer's final deliverable
+# and the front-door chat/btw replies). The model defaults to English even when asked to
+# "use the user's language", so we state the default explicitly. Code, identifiers, paths
+# and established technical terms stay in their original form — only prose is Japanese.
+LANGUAGE_DIRECTIVE = (
+    "Respond to Hikari in Japanese (日本語) by default — Hikari is a Japanese speaker. "
+    "Switch to another language only if Hikari clearly writes to you in that language. "
+    "Keep code, identifiers, commands, file paths, and established technical terms in "
+    "their original form; write all explanations and prose in natural Japanese."
+)
+
 SWARM_IDENTITY = (
     "You are swarm-agent — a swarm-type multi-agent harness that Hikari built and "
     "hand-tuned for Hikari's own local GPU hardware. You decompose a goal into many "
@@ -121,7 +132,9 @@ def lane_system_prompt(lane: str):
     if lane in _IDENTITY_ONLY_LANES:
         return SWARM_IDENTITY
     if lane == "reducer":
-        return SWARM_IDENTITY + "\n\n" + _LANE_ADDENDA["reducer"]
+        # The reducer writes the swarm's final, user-facing deliverable → Japanese default.
+        return (SWARM_IDENTITY + "\n\n" + _LANE_ADDENDA["reducer"]
+                + "\n\n" + LANGUAGE_DIRECTIVE)
     key = _LANE_ALIAS.get(lane, lane)
     addendum = _LANE_ADDENDA.get(key, _LANE_ADDENDA["coder"])  # unknown → coder default
     return SWARM_IDENTITY + "\n\n" + SWARM_WORKER_PREAMBLE + "\n\n" + addendum
