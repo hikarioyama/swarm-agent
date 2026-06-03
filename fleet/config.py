@@ -61,6 +61,32 @@ def _envi_or_none(name):
 
 MAX_TOKENS = _envi_or_none("FLEET_MAX_TOKENS")  # None = model default (no cap)
 
+# ── Per-task wall-clock deadline (hard anti-wedge safety net) ─────────────────
+# A worker that runs a never-returning FOREGROUND command (a server, a GUI app) blocks its
+# thread forever; the engine cannot kill it (the terminal tool's own timeout + cleanup_vm do
+# NOT interrupt an in-flight command — measured). So the engine ABANDONS a task that exceeds
+# this many seconds (marks it failed, stops waiting) and runs workers on DAEMON threads so the
+# abandoned one can never block run()/process exit. 0 or negative = disabled (no deadline).
+TASK_TIMEOUT_S = _envf("FLEET_TASK_TIMEOUT", 300.0)
+
+# How long a new WRITING goal waits for a still-alive ABANDONED write worker (from an earlier
+# timed-out goal — its subprocess cannot be killed) to finish before starting, so it can't race
+# the stale writer and corrupt the workspace. Then it proceeds with a logged warning (never a
+# permanent stall). 0 = disabled (don't wait).
+ABANDONED_WRITER_WAIT_S = _envf("FLEET_ABANDONED_WRITER_WAIT", 300.0)
+
+# ── Planner output cap (separate from worker MAX_TOKENS) ─────────────────────
+# The planner emits the WHOLE task-DAG JSON in one shot; a big/multi-topic goal can run to
+# several thousand tokens. The old 6144 cap was too small — a large plan TRUNCATED mid-JSON
+# and the agent loop then churned truncation→continuation→max-iterations (×3 plan retries),
+# i.e. "planning seems to loop for minutes" (observed live). Give the planner generous
+# headroom so a complete plan lands in ONE generation. Env-tunable.
+PLANNER_MAX_TOKENS = _envi("FLEET_PLANNER_MAX_TOKENS", 16384)
+# Iterations for the planner agent loop. It is a single JSON generation (no tool loop), so a
+# small budget is right — and it BOUNDS the continuation churn if a plan ever still overflows
+# (one continuation, not four) before _plan falls back to a retry.
+PLANNER_MAX_ITERATIONS = _envi("FLEET_PLANNER_MAX_ITERATIONS", 2)
+
 # ── Static admission (process-engine / --admission static) ───────────────────
 # Target number of agents DECODING at once. Measured efficient region 32–64; 40 default.
 TARGET_INFLIGHT = _envi("FLEET_INFLIGHT", 40)
@@ -93,6 +119,16 @@ AIMD_KV_HI = _envf("FLEET_AIMD_KV_HI", 0.85)         # KV usage backoff threshol
 AIMD_TPUT_DROP = _envf("FLEET_AIMD_TPUT_DROP", 0.07) # rel. tok/s regression that triggers backoff
 AIMD_SATURATION = _envf("FLEET_AIMD_SAT", 0.9)       # only grow if running >= limit*this (gate full)
 
+# ── Parallel goal consumption (Option A) — PARALLEL_GOALS_PLAN ───────────────
+# K = how many QUEUED goals the completion manager may run at once. Read-only goals
+# (writer/analyst/researcher/reviewer/reducer lanes) run concurrently up to K and fill the
+# shared DecodeGate; writing goals (coder/code/worker lanes) always run EXCLUSIVELY. K
+# defaults to 1 == today's strict one-at-a-time behaviour, so the feature is inert until
+# opted in (set FLEET_MAX_CONCURRENT_GOALS=2 or 3 to enable). FLEET_PARALLEL_WRITES is
+# reserved (default OFF): writing goals stay exclusive regardless in Phase 1.
+MAX_CONCURRENT_GOALS = _envi("FLEET_MAX_CONCURRENT_GOALS", 1)
+PARALLEL_WRITES = os.environ.get("FLEET_PARALLEL_WRITES", "0") not in ("0", "false", "False")
+
 # ── Persistent board (None = in-memory) ──────────────────────────────────────
 BOARD_PATH = os.environ.get("FLEET_BOARD_PATH") or None
 
@@ -111,9 +147,11 @@ TOOL_PROFILES = {
     # ── worker swarm (lean, no persona/memory) ──
     # writer: pure reasoning/explanation/synthesis (0 tools). DEFAULT worker role.
     "writer":   [],
-    # coder: file edit + shell + code-exec. Deliberately NO `skills` — the bulk
-    # execution lane; a skills index would re-prefill every turn for little gain.
-    "coder":    ["file", "terminal", "search", "code_execution"],
+    # coder: file edit + shell + code-exec + skills. `skills` was deliberately omitted
+    # for prefill leanness, but execution lanes need the run-app skill so servers/GUI
+    # detach instead of foreground-blocking. The byte-identical same-role prefix means
+    # vLLM prefix-cache serves the skill index after worker #1 (cost amortised).
+    "coder":    ["file", "terminal", "search", "code_execution", "skills"],
     # researcher: web + skills. The `skills` toolset (skills_list/skill_view/
     # skill_manage) is the ONLY switch needed to expose ~/.hermes/skills/ —
     # system_prompt.py auto-injects the skill index when those tools are present.
@@ -123,14 +161,26 @@ TOOL_PROFILES = {
     # reviewer: read repo + skills (code-review / security-review skill docs).
     "reviewer": ["file", "search", "skills"],
     # ── legacy aliases (KEEP — existing callers/plans still emit these) ──
-    "worker":   ["file", "terminal", "search"],         # default lean coder (back-compat)
-    "code":     ["file", "terminal", "search", "code_execution"],  # alias of coder
+    "worker":   ["file", "terminal", "search", "skills"],  # default lean coder (back-compat)
+    "code":     ["file", "terminal", "search", "code_execution", "skills"],  # alias of coder
     "research": ["web"],                                # legacy research (no skills)
 }
 
 
 def toolsets_for(lane: str):
     return TOOL_PROFILES.get(lane, TOOL_PROFILES["worker"])
+
+
+# Tool-PROFILE toolsets that grant working-tree / shell mutation (write_file/patch/terminal/
+# code-exec). A lane is write-capable iff its profile contains ANY of these — classified by
+# real capability, not name (so analyst/reviewer, whose "file" toolset includes write_file,
+# count as writers; unknown lanes fall back to the write-capable worker profile = fail closed).
+WRITE_TOOLSETS = {"file", "terminal", "code_execution"}
+
+
+def lane_writes(lane: str) -> bool:
+    """True iff ``lane`` can mutate the working tree / run shell, by its real tool capability."""
+    return bool(set(toolsets_for(lane)) & WRITE_TOOLSETS)
 
 
 # ── Front-door PERSONA lanes ─────────────────────────────────────────────────
@@ -225,6 +275,10 @@ def validate() -> None:
         problems.append(
             f"ENROLL_MAX must be >= 1 (no worker threads otherwise); got {ENROLL_MAX} "
             f"(env FLEET_ENROLL_MAX)")
+    if MAX_CONCURRENT_GOALS < 1:
+        problems.append(
+            f"MAX_CONCURRENT_GOALS must be >= 1; got {MAX_CONCURRENT_GOALS} "
+            f"(env FLEET_MAX_CONCURRENT_GOALS)")
     if problems:
         raise ValueError(
             "fleet.config: invalid configuration:\n  - " + "\n  - ".join(problems))

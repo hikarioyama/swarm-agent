@@ -23,11 +23,69 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import thread as _ftypes
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable, Dict, Optional
 
 from . import config, metrics
 from .worker import has_visible_text, run_task_local
+
+# Serialises the brief ``threading.Thread`` swap in _DaemonThreadPoolExecutor (below).
+_DAEMON_SPAWN_LOCK = threading.Lock()
+
+# Abandoned (timed-out, un-killable) WRITE-capable worker futures still running in the
+# background. A new writing goal waits these out (runner) before starting, so it can't race a
+# stale writer. Pruned lazily as the daemons finally finish.
+_ABANDONED_WRITERS: "set" = set()
+_ABANDONED_LOCK = threading.Lock()
+
+
+def abandoned_writers_alive() -> bool:
+    """True iff any abandoned WRITE worker is still running. Prunes finished ones."""
+    with _ABANDONED_LOCK:
+        for f in list(_ABANDONED_WRITERS):
+            if f.done():
+                _ABANDONED_WRITERS.discard(f)
+        return bool(_ABANDONED_WRITERS)
+
+
+class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor whose workers are DAEMON threads, so one stuck in a never-returning
+    blocking command (which we cannot interrupt) can't block interpreter exit or our own
+    shutdown.
+
+    Version-robustness: we daemonize WITHOUT copying CPython's private executor internals
+    (which differ across versions — e.g. 3.14 dropped ``_initializer``/``_initargs`` and
+    changed ``_worker``'s signature). Instead we briefly install a daemon-defaulting
+    ``threading.Thread`` factory and delegate to whatever the running interpreter's own
+    ``_adjust_thread_count`` does. If anything about that fails on some future Python, we fall
+    back to the normal (non-daemon) pool — the swarm still un-wedges via timeout-abandon +
+    ``shutdown(wait=False)``; only clean process-exit on a *stuck* worker degrades."""
+
+    def _adjust_thread_count(self):
+        real_thread = threading.Thread
+
+        class _DaemonThread(real_thread):
+            def __init__(self, *a, **kw):
+                kw.setdefault("daemon", True)
+                super().__init__(*a, **kw)
+
+        with _DAEMON_SPAWN_LOCK:                    # serialise the brief global swap
+            before = set(_ftypes._threads_queues)
+            threading.Thread = _DaemonThread       # stdlib spawns workers via threading.Thread
+            try:
+                super()._adjust_thread_count()     # delegate to THIS interpreter's own logic
+            except Exception:                      # never let daemonisation break the pool
+                threading.Thread = real_thread
+                super()._adjust_thread_count()     # plain (non-daemon) fallback
+            finally:
+                threading.Thread = real_thread
+            # De-register the worker threads WE just spawned from concurrent.futures' atexit
+            # hook (_python_exit joins every registered thread — daemon or not — which would
+            # re-introduce the exit wedge on a stuck worker). Daemon-ness already excludes them
+            # from threading._shutdown; this excludes them from the futures atexit join too.
+            for t in set(_ftypes._threads_queues) - before:
+                _ftypes._threads_queues.pop(t, None)
 
 
 def _enrolled_target(gate, cfg) -> int:
@@ -61,14 +119,17 @@ class ThreadFleet:
                   enrolled target and is the actual KV bound via compat's wrapper.
         cfg:      config module (injectable); defaults to config.
         on_event: optional callback(kind, tid, **extra) for progress/logging.
+        worker_fn: injectable task runner; defaults to worker.run_task_local.
     """
 
     def __init__(self, board, gate, cfg=config,
-                 on_event: Optional[Callable[..., None]] = None) -> None:
+                 on_event: Optional[Callable[..., None]] = None,
+                 worker_fn=None) -> None:
         self.board = board
         self.gate = gate
         self.cfg = cfg
         self.on_event = on_event or (lambda *a, **k: None)
+        self.worker_fn = worker_fn or run_task_local
         self.max_retries = cfg.MAX_RETRIES
         # duty / throughput accounting from live metrics. Sampling runs OFF the hot
         # loop on a daemon thread (see _sampler_loop / review #2) so a slow /metrics
@@ -122,71 +183,100 @@ class ThreadFleet:
         sampler = threading.Thread(target=self._sampler_loop,
                                    name="fleet-metrics-sampler", daemon=True)
         sampler.start()
+        ex = _DaemonThreadPoolExecutor(max_workers=self.cfg.ENROLL_MAX,
+                                       thread_name_prefix="fleet-w")
         try:
-            with ThreadPoolExecutor(max_workers=self.cfg.ENROLL_MAX,
-                                    thread_name_prefix="fleet-w") as ex:
-                futs: Dict[object, str] = {}                    # future -> task id
+            futs: Dict[object, str] = {}                        # future -> task id
+            started: Dict[object, float] = {}                   # future -> monotonic start
+            lane_of: Dict[object, str] = {}                     # future -> lane
+            task_timeout = float(getattr(self.cfg, "TASK_TIMEOUT_S", 0) or 0)
 
-                while self.board.unfinished() > 0 or futs:
-                    target = _enrolled_target(self.gate, self.cfg)
-                    slots = target - len(futs)
-                    # review #4: counts() is O(tasks) under the board lock — compute it
-                    # AT MOST ONCE per loop tick and reuse the snapshot for every event
-                    # emitted this pass, rather than per dispatch/done event.
-                    tick_counts = None
-                    if slots > 0:
-                        # lane-aware: Board.claim_ready injects dep_results into spec.meta;
-                        # the DecodeGate then serves the claimed tasks by lane priority.
-                        claimed = self.board.claim_ready(slots)
-                        if claimed:
-                            tick_counts = self.board.counts()
-                        for t in claimed:
-                            futs[ex.submit(run_task_local, t.spec())] = t.id
-                            self._emit("dispatch", t.id, counts=tick_counts,
-                                       target=target, running=len(futs) + 1)
+            while self.board.unfinished() > 0 or futs:
+                target = _enrolled_target(self.gate, self.cfg)
+                slots = target - len(futs)
+                # review #4: counts() is O(tasks) under the board lock — compute it
+                # AT MOST ONCE per loop tick and reuse the snapshot for every event
+                # emitted this pass, rather than per dispatch/done event.
+                tick_counts = None
+                if slots > 0:
+                    # lane-aware: Board.claim_ready injects dep_results into spec.meta;
+                    # the DecodeGate then serves the claimed tasks by lane priority.
+                    claimed = self.board.claim_ready(slots)
+                    if claimed:
+                        tick_counts = self.board.counts()
+                    for t in claimed:
+                        f = ex.submit(self.worker_fn, t.spec())
+                        futs[f] = t.id
+                        started[f] = time.monotonic()
+                        lane_of[f] = t.lane
+                        self._emit("dispatch", t.id, counts=tick_counts,
+                                   target=target, running=len(futs) + 1)
 
-                    if not futs:
-                        # nothing in flight: either we're done, or we're wedged
-                        if self.board.unfinished() > 0:
-                            # review #3: a real dep-deadlock (work remains, nothing
-                            # ready, nothing in flight). Record the stranded count so
-                            # the summary/CLI can exit non-zero — counts['failed'] alone
-                            # would report SUCCESS for tasks stuck PENDING forever.
-                            stranded = self.board.unfinished()
-                            self._emit("deadlock", None,
-                                       counts=self.board.counts(), stranded=stranded)
-                        break
+                if not futs:
+                    # nothing in flight: either we're done, or we're wedged
+                    if self.board.unfinished() > 0:
+                        # review #3: a real dep-deadlock (work remains, nothing
+                        # ready, nothing in flight). Record the stranded count so
+                        # the summary/CLI can exit non-zero — counts['failed'] alone
+                        # would report SUCCESS for tasks stuck PENDING forever.
+                        stranded = self.board.unfinished()
+                        self._emit("deadlock", None,
+                                   counts=self.board.counts(), stranded=stranded)
+                    break
 
-                    # Wake periodically even if no future completes, so we can grow
-                    # enrolled when AIMD widens the gate. (Duty/throughput sampling is
-                    # the sampler thread's job now — review #2.)
-                    done, _ = wait(list(futs), timeout=1.0, return_when=FIRST_COMPLETED)
+                # Wake periodically even if no future completes, so we can grow
+                # enrolled when AIMD widens the gate. (Duty/throughput sampling is
+                # the sampler thread's job now — review #2.)
+                done, _ = wait(list(futs), timeout=1.0, return_when=FIRST_COMPLETED)
 
-                    if done and tick_counts is None:
-                        tick_counts = self.board.counts()       # one snapshot for the batch
-                    for f in done:
+                # ABANDON rather than kill: terminal timeout + cleanup_vm were measured
+                # not to interrupt in-flight commands. Daemon workers and non-blocking
+                # shutdown make abandonment safe; the run-app skill prevents the cause.
+                if task_timeout > 0:
+                    now = time.monotonic()
+                    overdue = [f for f in list(futs) if f not in done
+                               and now - started.get(f, now) > task_timeout]
+                    for f in overdue:
                         tid = futs.pop(f)
-                        try:
-                            res = f.result()
-                            if not has_visible_text(res.get("text", "")):
-                                raise RuntimeError("worker returned an empty visible response")
-                            results[tid] = res
-                            self.board.complete(tid, res.get("text", ""))
-                            self._emit("done", tid, counts=tick_counts,
-                                       wall_s=res.get("wall_s"),
-                                       decode_s=res.get("decode_s"),
-                                       tool_s=res.get("tool_s"),
-                                       gatewait_s=res.get("gatewait_s"),
-                                       turns=res.get("turns"))
-                        except Exception as e:
-                            requeued = self.board.fail(tid, repr(e), self.max_retries)
-                            self._emit("requeue" if requeued else "fail", tid,
-                                       counts=tick_counts, error=repr(e)[:160])
+                        started.pop(f, None)
+                        lane = lane_of.pop(f, "")
+                        write_capable = config.lane_writes(lane)
+                        if write_capable:
+                            with _ABANDONED_LOCK:
+                                _ABANDONED_WRITERS.add(f)   # a new writer must wait this out (runner)
+                        error = f"timeout: exceeded FLEET_TASK_TIMEOUT={task_timeout:g}s"
+                        self.board.fail(tid, error, 0)
+                        self._emit("fail", tid, counts=self.board.counts(),
+                                   error=error + (" [write worker still alive]" if write_capable else ""))
+
+                if done and tick_counts is None:
+                    tick_counts = self.board.counts()           # one snapshot for the batch
+                for f in done:
+                    tid = futs.pop(f)
+                    started.pop(f, None)
+                    lane_of.pop(f, None)
+                    try:
+                        res = f.result()
+                        if not has_visible_text(res.get("text", "")):
+                            raise RuntimeError("worker returned an empty visible response")
+                        results[tid] = res
+                        self.board.complete(tid, res.get("text", ""))
+                        self._emit("done", tid, counts=tick_counts,
+                                   wall_s=res.get("wall_s"),
+                                   decode_s=res.get("decode_s"),
+                                   tool_s=res.get("tool_s"),
+                                   gatewait_s=res.get("gatewait_s"),
+                                   turns=res.get("turns"))
+                    except Exception as e:
+                        requeued = self.board.fail(tid, repr(e), self.max_retries)
+                        self._emit("requeue" if requeued else "fail", tid,
+                                   counts=tick_counts, error=repr(e)[:160])
         finally:
             # review #2: always stop + join the sampler so no daemon thread or socket
             # leaks past run() (matters for repeated runs / A-B in one process).
             self._stop_sampler.set()
             sampler.join(timeout=self._sample_timeout + self._sample_period + 1.0)
+            ex.shutdown(wait=False, cancel_futures=True)        # never await stuck workers
 
         wall_s = round(time.time() - self.t0, 1)
         gate_stats = self.gate.stats() if self.gate is not None else None

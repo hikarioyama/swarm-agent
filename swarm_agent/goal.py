@@ -7,7 +7,9 @@ import re
 from pathlib import Path
 from typing import Iterable
 
+from fleet import config
 from fleet.board import Task
+from fleet.config import WRITE_TOOLSETS, lane_writes  # re-exported; capability-based classifier
 from fleet.worker import _final_text
 
 
@@ -33,7 +35,20 @@ def _extract_json(text: str):
 
 
 def validate_tasks(tasks: Iterable[Task]) -> list[Task]:
-    """Return a validated acyclic DAG with at least one reducer sink."""
+    """Return a validated acyclic DAG with exactly one reducer sink.
+
+    Auto-repair (turn the common planner slips into valid plans instead of a hard
+    "plan parse failed" — which costs a full ~8s plan REGENERATION on retry):
+      * NO reducer lane — the planner very often (~75% on wide goals, measured) emits the
+        final integrating task with the WRONG lane (e.g. "writer") even though it is the
+        sole sink that depends on every leaf. PROMOTE that integrating sink to "reducer"
+        instead of failing: the task everything feeds into IS the reducer regardless of the
+        label the planner stuck on it.
+      * MULTIPLE reducers — keep the last reducer as the canonical sink and demote the
+        others to "writer" (intermediate synthesis leaves that feed the final reducer).
+      * ORPHAN leaves — any task nothing depends on is wired INTO the canonical reducer
+        (which is meant to integrate every leaf anyway), so it becomes the sole sink.
+    """
     out = list(tasks)
     if not out:
         raise ValueError("planner returned no tasks")
@@ -44,6 +59,37 @@ def validate_tasks(tasks: Iterable[Task]) -> list[Task]:
         missing = sorted(set(task.deps) - by_id.keys())
         if missing:
             raise ValueError(f"task {task.id!r} has unknown deps: {missing}")
+
+    # Collapse to ONE reducer sink + wire orphan leaves into it (see docstring). No-op if
+    # the plan is already well-formed. Cycle check runs AFTER, so any repair edges are
+    # validated too.
+    reducers = [t for t in out if t.lane == "reducer"]
+    if not reducers and len(out) > 1:
+        # No task is labelled "reducer" — promote the integrating sink (the planner very
+        # often mislabels it "writer"). Promote ONLY a genuine fan-in INTEGRATOR: a sink that
+        # (a) DEPENDS on other tasks (so its result actually synthesises them) and (b) is
+        # NON-write-capable (promoting a coder/analyst would strip its file/shell tools and
+        # drop real work). NEVER promote an independent leaf — its prompt is its own unit of
+        # work, not synthesis, so final_result() would report just that leaf and silently omit
+        # the rest. If there is no such integrator (e.g. several independent leaves, or only
+        # write-capable sinks), leave the plan unrepaired: the sink check below raises and
+        # _plan() retries for a properly-wired reducer. Tie-break to the LAST (most deps).
+        depended_on = {dep for task in out for dep in task.deps}
+        sinks = [t for t in out if t.id not in depended_on]
+        integrators = [t for t in sinks if t.deps and not lane_writes(t.lane)]
+        if integrators:
+            cand = max(reversed(integrators), key=lambda t: len(t.deps))
+            cand.lane = "reducer"
+            reducers = [cand]
+    if reducers:
+        red = reducers[-1]                       # canonical sink = the last reducer
+        for extra in reducers[:-1]:              # demote any other reducers to leaves
+            extra.lane = "writer"
+        depended_on = {dep for task in out for dep in task.deps}
+        for task in out:
+            if (task is not red and task.id not in depended_on
+                    and task.id not in red.deps):
+                red.deps.append(task.id)
 
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -86,13 +132,66 @@ def tasks_from_json(data) -> list[Task]:
     return validate_tasks(tasks)
 
 
+def classify_plan(tasks: Iterable[Task]) -> str:
+    """Return "read-only" iff NO task can write, else "writing" (run exclusively).
+
+    Classified by real tool capability (``lane_writes``): a goal is safe to run concurrently
+    only if every one of its lanes is genuinely non-mutating (writer/researcher/reducer and
+    the like). A lane that carries file/terminal/code tools — including analyst/reviewer
+    (whose "file" toolset exposes write_file/patch) and any unrecognised lane (→ write-capable
+    worker fallback) — forces the whole goal to "writing". Fail closed: an empty/degenerate
+    plan is also "writing" (never run something unclassifiable alongside others)."""
+    tasks = list(tasks)
+    if not tasks:
+        return "writing"
+    return "writing" if any(lane_writes(t.lane) for t in tasks) else "read-only"
+
+
+def namespace_tasks(tasks: Iterable[Task], prefix: str) -> list[Task]:
+    """Return NEW Task objects with every id (and dep) prefixed by ``prefix`` so two
+    concurrent goals can never share a task id — which would collide their per-worker
+    sandbox cwd (compat.worker_sandbox keys on spec["id"]) (PARALLEL_GOALS_PLAN §4.3).
+
+    Does not mutate the input tasks. Re-validates the result (still an acyclic DAG with one
+    reducer sink). A prefix already present is not doubled.
+    """
+    def nid(i: str) -> str:
+        return i if i.startswith(f"{prefix}.") else f"{prefix}.{i}"
+    out = [Task(id=nid(t.id), prompt=t.prompt, deps=[nid(d) for d in t.deps],
+                lane=t.lane, meta=dict(t.meta)) for t in tasks]
+    return validate_tasks(out)
+
+
 PLANNER_PROMPT = """You are the planner for a high-concurrency software swarm. Decompose
 the user's goal into independent tasks that run in parallel, plus ONE final reducer task
 that synthesizes them into the deliverable.
 
-Maximize useful parallelism but do not invent busywork: use as few tasks as the goal
-needs (2-12; fewer for simple goals). Each task is a specific, standalone assignment
-whose result is plain text.
+Design the MOST EFFICIENT workflow for THIS environment. The runtime runs MANY tasks at
+once (its efficient operating point is dozens of agents generating concurrently — tens in
+flight is cheap), every worker is a lean ~8K-context agent with a bounded turn budget, and
+total wall-clock ≈ the LONGEST dependency chain, NOT the sum of the work. So shape the DAG
+for that machine:
+
+1. MAXIMISE PARALLEL BREADTH, MINIMISE DEPTH. Tasks that do not consume each other's output
+   MUST be independent (empty "deps") so they run at the SAME time. Add a dependency ONLY
+   when a task genuinely needs another's result. Aim for one WIDE layer of independent
+   tasks feeding the single reducer; avoid long A→B→C chains (each link is serial wall-time).
+2. ONE TASK PER INDEPENDENT UNIT. If the goal spans many units ("for each X", several
+   files / modules / topics / sections / sources), emit a SEPARATE task per unit so they
+   run in parallel — never serialise them, never lump them into one task.
+3. RIGHT-SIZE EACH TASK. Each task is run by ONE lean worker with a bounded turn budget. A
+   task that is too big makes that worker churn or run out of turns — split it into parallel
+   pieces. A trivially tiny task wastes overhead — merge it. Target a scope a focused worker
+   finishes in a few turns.
+4. RESPECT THE SINGLE REDUCER. Exactly ONE reducer integrates ALL leaves and its context is
+   finite, so keep the leaf count sensible and instruct each leaf to return a CONCISE,
+   structured result the reducer can absorb without overflowing.
+5. CHEAPEST CAPABLE LANE (see below). Breadth is cheap, but every tool a lane carries is
+   re-paid on every turn — still pick the smallest lane per task.
+
+Scale the task count to the goal — do not invent busywork; each task must earn its place:
+trivial → 1-3 tasks; medium → 4-8; large / many-unit → fan out wide (up to ~16-20 concise
+leaves). Each task is a specific, standalone assignment whose result is plain text.
 
 Assign each task a "lane" by the CAPABILITY it truly needs. Tools and skills are not
 free: each tool a lane carries is re-sent on every turn and can fail on a task that did
@@ -138,10 +237,20 @@ Deliverable type — decide this FIRST:
 
 Return ONLY a JSON array. Each item has:
   {{"id":"short-id","prompt":"specific standalone assignment","deps":[],"lane":"writer"}}
-The FINAL item must have lane "reducer", depend on every required upstream task, and
-instruct the reducer to produce the complete integrated deliverable — for a FILE/RUNNABLE
-goal the files are written by the coder task(s); the reducer then only reports concisely
-what was built and the verification result (it must not try to write files itself).
+
+REDUCER WIRING — get this exactly right or the plan is invalid:
+  - There is EXACTLY ONE task with lane "reducer". It is the LAST item and the ONLY sink.
+  - Its "deps" MUST list the id of EVERY other task (every leaf), so it waits for all of
+    them and integrates their results. Do not leave any task unconnected.
+  - NOTHING may depend on the reducer (no task lists the reducer's id in its deps).
+  - Use at most ONE reducer — never two. Independent leaves keep "deps":[] (they run in
+    parallel); only the reducer (and any genuine A→B consumer) carries deps.
+Example shape for a 3-unit goal: three leaves with "deps":[], then
+  {{"id":"reduce","lane":"reducer","deps":["unit1","unit2","unit3"],"prompt":"…"}}
+
+The reducer produces the complete integrated deliverable — for a FILE/RUNNABLE goal the
+files are written by the coder task(s); the reducer then only reports concisely what was
+built and the verification result (it must not try to write files itself).
 
 User goal:
 {goal}

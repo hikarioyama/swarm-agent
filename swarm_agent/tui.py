@@ -22,7 +22,7 @@ from pathlib import Path
 
 from fleet import config, metrics
 from .runner import SwarmRunner
-from .dashboard import SwarmView
+from .dashboard import SwarmView, MultiSwarmView
 
 
 LOG_PATH = Path(os.environ.get(
@@ -38,6 +38,7 @@ HELP = [
     "/chat  MSG      force one direct single-agent reply",
     "/task GOAL      queue a goal; the completion manager runs it to done",
     "/tasks          list the persistent task queue",
+    "/btw <q>        ask an INDEPENDENT worker about the current situation (works mid-run)",
     "mouse drag      select chat text and copy it (the status panel is left alone)",
     "/copy [last]    also copy the conversation (or last reply) to the clipboard",
     "Ctrl+Y          copy the last reply to the clipboard",
@@ -232,6 +233,7 @@ class ChatLog:
     _STYLE = {                                  # kind -> (palette-key, first-prefix, cont-prefix)
         "user":      ("gold", "❯ ", "  "),
         "assistant": ("fg",   "  ", "  "),
+        "btw":       ("run",  "btw › ", "      "),
         "status":    ("dim",  "· ", "  "),
         "error":     ("err",  "✗ ", "  "),
     }
@@ -256,7 +258,7 @@ class ChatLog:
             key, first, cont = self._STYLE.get(kind, ("fg", "  ", "  "))
             for j, seg in enumerate(self._wrap(text, width - 2)):
                 lines.append(((first if j == 0 else cont) + seg, key))
-            if kind in ("assistant", "error"):
+            if kind in ("assistant", "btw", "error"):
                 lines.append(("", "dim"))
         return lines
 
@@ -290,7 +292,7 @@ class App:
         self.stdscr = stdscr
         self.runner = SwarmRunner()
         self.chat = ChatLog()
-        self.swarm = SwarmView()
+        self.swarm = MultiSwarmView()
         self.meter = metrics.ThroughputMeter()
         self.input = ""
         self.show_help = False
@@ -360,7 +362,6 @@ class App:
             elif kind == "planning":
                 self.phase = "planning"
             elif kind == "planned":
-                self.swarm.goal = self._last_goal()
                 self._task_total = int(ev.get("n") or 0)
                 self.chat.add("status", f"planned → {ev.get('n')} parallel tasks")
                 self.phase = f"dispatching {ev.get('n')} tasks"
@@ -372,17 +373,34 @@ class App:
             elif kind == "reply":
                 self.chat.add("assistant", ev.get("text", ""))
                 self.phase = ""
+            elif kind == "btw":
+                self.chat.add("btw", ev.get("text", ""))
             elif kind == "final":
+                gid = ev.get("goal_id")
+                if gid and len(self.swarm.active_views()) > 1:
+                    label = self.swarm.goal_label(gid) or gid
+                    self.chat.add("status", f"▸ {label[:40]}")
                 self.chat.add("assistant", ev.get("text", ""))
                 self.chat.add("status", self._summary_line(ev.get("stats")))
                 self.phase = ""
             elif kind == "error":
+                # Tag which concurrent goal failed (same header as 'final'), so a failure
+                # among several parallel goals is attributable without opening /tasks.
+                gid = ev.get("goal_id")
+                if gid and len(self.swarm.active_views()) > 1:
+                    label = self.swarm.goal_label(gid) or gid
+                    self.chat.add("status", f"▸ {label[:40]}")
                 self.chat.add("error", ev.get("text", "error"))
                 self.phase = ""
             elif kind == "idle":
-                self.message = "ready"
-                self.started_at = None
-                self.phase = ""
+                # One turn ended — but with parallel goals OTHERS may still be in flight, and
+                # idle is emitted per-turn (carries goal_id). Only reset the GLOBAL status
+                # chrome (ready / elapsed / phase) when nothing is left running, so a finished
+                # goal doesn't make the UI report "ready" while peers keep working.
+                if not self.runner.busy:
+                    self.message = "ready"
+                    self.started_at = None
+                    self.phase = ""
                 self._drain_pending()
 
     def _last_goal(self) -> str:
@@ -434,9 +452,15 @@ class App:
                 for rec in snapshot:
                     self.chat.add(
                         "status", f"[{rec['state']}] {rec['id']} · {rec['goal'][:60]}")
+        elif command == "btw":
+            if not argument:
+                self.message = "usage: /btw <question about the current situation>"
+            else:
+                self.runner.ask_status(argument, self._situation_snapshot())
+                self.message = "asking an independent worker… (answer appears below)"
         elif command == "clear":
             self.chat.clear()
-            self.swarm = SwarmView()
+            self.swarm = MultiSwarmView()
             self.scroll = 0
             self.message = "cleared"
         elif command == "gate":
@@ -466,6 +490,46 @@ class App:
         if self.pending and not self.runner.busy:
             text, force_mode = self.pending.pop(0)
             self.runner.submit(text, force_mode=force_mode)
+
+    def _situation_snapshot(self) -> str:
+        """A concise plain-text summary of what the swarm is doing RIGHT NOW, for /btw.
+        Pulls only from what the App already holds — no extra model/IO calls. Summarises
+        EVERY active goal (parallel consumption), not just one."""
+        L: list[str] = []
+        L.append(f"Runner: {'BUSY' if self.runner.busy else 'idle'}"
+                 + (f' · phase: {self.phase}' if self.phase else ''))
+        active = self.swarm.active_views()
+        if active:
+            L.append(f"Active swarms: {len(active)}")
+            for key, sv in active:
+                if not sv.order and not sv.goal:
+                    continue
+                c = sv.counts or {}
+                head = sv.goal or ("(typed turn)" if key == "_interactive" else key)
+                L.append(f"• {head} — {len(sv.order)} tasks: "
+                         f"done {c.get('done',0)}, running {c.get('running',0)}, "
+                         f"failed {c.get('failed',0)}")
+                for tid in sv.order[:8]:
+                    t = sv.tasks.get(tid, {})
+                    L.append(f"    [{t.get('state','?')}] {tid} ({t.get('lane','?')}): "
+                             f"{(t.get('prompt') or '')[:60]}")
+        q = self.runner.tasks.counts()
+        if q.get("total"):
+            L.append(f"Persistent task queue: pending {q['pending']}, running {q['running']}, "
+                     f"done {q['done']}, failed {q['failed']}")
+            for r in self.runner.tasks.snapshot():
+                if r["state"] in ("pending", "running"):
+                    L.append(f"  [{r['state']}] {r['goal'][:60]}")
+        if self._sc:
+            gate = self.runner.gate.get_limit() if self.runner.gate is not None else "?"
+            L.append(f"Metrics: gate {gate} · running {self._sc.get('running','?')} · "
+                     f"kv {self._sc.get('kv','?')} · {self._tok_s:.0f} tok/s")
+        hist = self.runner.history[-4:]
+        if hist:
+            L.append("Recent conversation:")
+            for role, text in hist:
+                L.append(f"  {role}: {text[:80]}")
+        return "\n".join(L)
 
     # ── clipboard: copy the CHAT pane (never the status panel) ───────────────────
     def _copy(self, last_only: bool) -> None:

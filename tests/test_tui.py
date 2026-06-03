@@ -180,6 +180,24 @@ def test_busy_guard_rejects_reentry() -> None:
     r.shutdown()
 
 
+def test_btw_runs_independently_and_emits(monkeypatch) -> None:
+    import time
+    r = SwarmRunner()
+    monkeypatch.setattr(r, "_run_agent", lambda *a, **k: "current status: 2 tasks running")
+    r.ask_status("what's going on?", "Runner: BUSY")
+    # poll the event queue briefly for the 'btw' event (runs on a daemon thread)
+    got = None
+    for _ in range(50):
+        try:
+            ev = r.events.get(timeout=0.1)
+        except Exception:
+            ev = None
+        if ev and ev.get("kind") == "btw":
+            got = ev; break
+    r.shutdown()
+    assert got is not None and "2 tasks running" in got["text"]
+
+
 # ── persistent completion queue ───────────────────────────────────────────────
 def test_taskstore_transitions_persistence_and_running_recovery(tmp_path) -> None:
     path = tmp_path / "tasks.json"
@@ -277,3 +295,165 @@ def test_chat_plaintext_copies_chat_only_not_status() -> None:
     assert "queued → task added" not in whole         # status chrome is never copied
     assert _chat_plaintext(blocks, last_only=True) == "answer two"
     assert _chat_plaintext([], last_only=True) == ""
+
+
+# ── planner DAG: auto-repair the common "orphan leaf" slip ────────────────────
+def test_validate_tasks_autowires_orphan_leaves_into_reducer() -> None:
+    from swarm_agent.goal import tasks_from_json
+    # 3 parallel leaves but the reducer only wired one of them (b, c orphaned) — the
+    # planner's most common mistake. validate must REPAIR (wire b, c in), not fail.
+    plan = [
+        {"id": "a", "prompt": "x", "lane": "writer", "deps": []},
+        {"id": "b", "prompt": "y", "lane": "writer", "deps": []},
+        {"id": "c", "prompt": "z", "lane": "writer", "deps": []},
+        {"id": "r", "prompt": "synthesise", "lane": "reducer", "deps": ["a"]},
+    ]
+    tasks = tasks_from_json(plan)                       # must NOT raise
+    red = next(t for t in tasks if t.lane == "reducer")
+    assert set(red.deps) == {"a", "b", "c"}            # every leaf now feeds the reducer
+
+
+def test_validate_tasks_collapses_two_reducers_to_one_sink() -> None:
+    from swarm_agent.goal import tasks_from_json
+    # Planner emitted TWO reducers (its other common slip). Repair: keep the last as the
+    # sole sink, demote the earlier one to a 'writer' leaf that feeds it.
+    plan = [
+        {"id": "a", "prompt": "x", "lane": "writer", "deps": []},
+        {"id": "r1", "prompt": "partial", "lane": "reducer", "deps": ["a"]},
+        {"id": "r2", "prompt": "final", "lane": "reducer", "deps": ["a"]},
+    ]
+    tasks = tasks_from_json(plan)                       # must NOT raise
+    reducers = [t for t in tasks if t.lane == "reducer"]
+    assert len(reducers) == 1 and reducers[0].id == "r2"   # last reducer is canonical
+    assert next(t for t in tasks if t.id == "r1").lane == "writer"  # the other demoted
+    sinks = [t for t in tasks if t.id not in {d for x in tasks for d in x.deps}]
+    assert len(sinks) == 1 and sinks[0].id == "r2"     # exactly one sink, the reducer
+
+
+def test_validate_tasks_promotes_mislabeled_sink_to_reducer() -> None:
+    from swarm_agent.goal import tasks_from_json
+    # The planner's MOST common slip on wide goals (measured ~75%): it emits a perfect
+    # fan-in DAG but labels the sole integrating sink "writer" instead of "reducer". Repair
+    # must PROMOTE that sink to reducer (it's what everything feeds into) rather than fail +
+    # cost a full ~8s plan regeneration on retry.
+    plan = [{"id": f"u{i}", "prompt": "p", "lane": "writer", "deps": []} for i in range(5)]
+    plan.append({"id": "reduce", "prompt": "synthesise", "lane": "writer",
+                 "deps": [f"u{i}" for i in range(5)]})
+    tasks = tasks_from_json(plan)                       # must NOT raise
+    reducers = [t for t in tasks if t.lane == "reducer"]
+    assert len(reducers) == 1 and reducers[0].id == "reduce"   # sink promoted to reducer
+    sinks = [t for t in tasks if t.id not in {d for x in tasks for d in x.deps}]
+    assert len(sinks) == 1 and sinks[0].id == "reduce"
+
+
+def test_validate_tasks_no_reducer_no_integrator_is_rejected() -> None:
+    from swarm_agent.goal import tasks_from_json
+    # No reducer + only INDEPENDENT leaves (no fan-in integrator): there is no task that
+    # synthesises the others, so promoting an arbitrary leaf would report just that leaf and
+    # silently drop the rest. validate must REJECT (raise) so _plan() retries for a real
+    # reducer — NOT fabricate one.
+    plan = [{"id": x, "prompt": "p", "lane": "writer", "deps": []} for x in ("a", "b", "c")]
+    try:
+        tasks_from_json(plan)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("independent leaves with no integrator must not be auto-repaired")
+
+
+def test_validate_tasks_does_not_promote_write_capable_sink() -> None:
+    from swarm_agent.goal import tasks_from_json
+    # No reducer + only independent CODER leaves: promoting one to reducer would strip its
+    # file/shell tools and silently drop its write work (Codex review P2). Must NOT repair —
+    # raise instead so the planner retry regenerates a real reducer.
+    plan = [{"id": "f1", "prompt": "write file A", "lane": "coder", "deps": []},
+            {"id": "f2", "prompt": "write file B", "lane": "coder", "deps": []}]
+    try:
+        tasks_from_json(plan)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("write-capable sinks must not be auto-promoted to reducer")
+    # But a NON-write integrator sink alongside coder leaves IS promoted (coders keep tools).
+    plan2 = [{"id": "f1", "prompt": "write file A", "lane": "coder", "deps": []},
+             {"id": "sum", "prompt": "summarise", "lane": "writer", "deps": ["f1"]}]
+    tasks = tasks_from_json(plan2)
+    red = [t for t in tasks if t.lane == "reducer"]
+    assert len(red) == 1 and red[0].id == "sum"        # the writer integrator promoted
+    assert next(t for t in tasks if t.id == "f1").lane == "coder"   # coder keeps its tools
+
+
+def test_multiswarm_single_goal_renders_like_single_view() -> None:
+    from swarm_agent.dashboard import MultiSwarmView
+    mv = MultiSwarmView()
+    mv.ingest({"kind": "user", "text": "only goal", "goal_id": "g1"})
+    mv.ingest({"kind": "planning", "goal_id": "g1"})
+    mv.ingest({"kind": "planned", "goal_id": "g1", "tasks": [
+        {"id": "a", "lane": "writer", "deps": []},
+        {"id": "r", "lane": "reducer", "deps": ["a"]}]})
+    rows: list[str] = []
+    pal = {k: 0 for k in ("gold", "ok", "err", "run", "dim", "head", "fg", "warn")}
+    mv.render(lambda y, x, t, a=0: rows.append(t), (2, 0, 24, 40),
+              palette=pal, gate_limit=40, running=1, kv_pct="1%", tok_s=0.0, busy=True)
+    assert any("WORKERS" in r for r in rows)          # delegated to a single SwarmView layout
+    assert any("TASKS" in r for r in rows)
+
+
+def test_multiswarm_two_goals_render_compact_blocks() -> None:
+    from swarm_agent.dashboard import MultiSwarmView
+    mv = MultiSwarmView()
+    for gid, text in (("g1", "audit repo"), ("g2", "summarise docs")):
+        mv.ingest({"kind": "user", "text": text, "goal_id": gid})
+        mv.ingest({"kind": "planning", "goal_id": gid})
+        mv.ingest({"kind": "planned", "goal_id": gid, "tasks": [
+            {"id": "a", "lane": "writer", "deps": []},
+            {"id": "r", "lane": "reducer", "deps": ["a"]}]})
+    rows: list[str] = []
+    pal = {k: 0 for k in ("gold", "ok", "err", "run", "dim", "head", "fg", "warn")}
+    mv.render(lambda y, x, t, a=0: rows.append(t), (2, 0, 24, 40),
+              palette=pal, gate_limit=40, running=2, kv_pct="2%", tok_s=10.0, busy=True)
+    assert any("2 goals" in r for r in rows)          # multi title
+    assert any("audit repo" in r for r in rows)
+    assert any("summarise docs" in r for r in rows)
+
+
+def test_multiswarm_render_short_pane_no_crash() -> None:
+    from swarm_agent.dashboard import MultiSwarmView
+    mv = MultiSwarmView()
+    for gid in ("g1", "g2", "g3"):
+        mv.ingest({"kind": "user", "text": gid, "goal_id": gid})
+        mv.ingest({"kind": "planning", "goal_id": gid})
+    pal = {k: 0 for k in ("gold", "ok", "err", "run", "dim", "head", "fg", "warn")}
+    for bottom in (4, 6, 9, 30):
+        mv.render(lambda y, x, t, a=0: None, (2, 0, bottom, 40),
+                  palette=pal, gate_limit=40, running=1, kv_pct="1%", tok_s=1.0)
+
+
+# ── parallel goals: a finished goal must not blank the global status while peers run ──
+def test_idle_keeps_global_status_while_another_goal_runs(tmp_path, monkeypatch) -> None:
+    # When two queued goals run at once, the FIRST 'idle' must not reset the global UI
+    # chrome to "ready" / drop elapsed tracking while the second goal is still in flight.
+    monkeypatch.setenv("SWARM_TASKS_PATH", str(tmp_path / "tasks.json"))
+    from swarm_agent.tui import App
+    app = App(None)                                  # __init__ touches no curses / network
+    try:
+        with app.runner._busy_lock:                 # simulate two goal turns in flight
+            app.runner._active["g1"] = None
+            app.runner._active["g2"] = None
+        app.started_at, app.phase, app.message = 123.0, "running", "working…"
+
+        with app.runner._busy_lock:                 # g1's turn ends (pops itself) then emits idle
+            app.runner._active.pop("g1")
+        app.runner.events.put({"kind": "idle", "goal_id": "g1"})
+        app.pump()
+        assert app.runner.busy                       # g2 still running
+        assert (app.message, app.started_at, app.phase) == ("working…", 123.0, "running")
+
+        with app.runner._busy_lock:                 # g2 ends -> now truly idle
+            app.runner._active.pop("g2")
+        app.runner.events.put({"kind": "idle", "goal_id": "g2"})
+        app.pump()
+        assert not app.runner.busy
+        assert (app.message, app.started_at, app.phase) == ("ready", None, "")
+    finally:
+        app.runner.shutdown()

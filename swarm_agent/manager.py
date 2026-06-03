@@ -41,34 +41,48 @@ class CompletionManager:
                 break
             try:
                 self._tick()
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                try:
+                    self.runner.log.event("manager_error", error=repr(e),
+                                          detail=traceback.format_exc())
+                except Exception:
+                    pass
 
     def _tick(self) -> None:
         snapshot = self.runner.tasks.snapshot()
-        if not self.runner.busy:
-            for rec in snapshot:
-                if rec.get("state") == "running":
-                    self.runner.tasks.requeue(rec["id"])
-                    self.runner.emit("manager", text=f"re-queued stalled task {rec['id']}")
+        # Re-queue stalled work: a record marked 'running' whose turn is NOT actually in
+        # flight (orphaned by a crash/dead thread). With parallel goals we can no longer use
+        # a single 'not busy' flag — check the live in-flight set instead.
+        active = self.runner.active_goal_ids()
+        for rec in snapshot:
+            if rec.get("state") == "running" and rec["id"] not in active:
+                self.runner.tasks.requeue(rec["id"])
+                self.runner.emit("manager", text=f"re-queued stalled task {rec['id']}")
 
-        if not self.runner.busy:
-            rec = self.runner.tasks.next_pending()
-            if rec is not None:
-                if not self._server_ok():
-                    # Hold pending work until the inference server is reachable. This
-                    # gates the immediate re-dispatch after a mid-run _ServerDown requeue,
-                    # so a down server backs off to the heartbeat cadence (no tight spin).
+        # Dispatch up to capacity. Probe the server ONCE: if it is down, hold all pending
+        # work (back off to the heartbeat) rather than claim-then-requeue churn.
+        if self.runner.tasks.has_unfinished() and self.runner.can_admit_goal():
+            if not self._server_ok():
+                # only announce if there is actually pending work to start
+                if any(r.get("state") == "pending" for r in snapshot):
                     self.runner.emit(
                         "manager",
                         text="waiting for inference server before starting queued work")
-                else:
+            else:
+                while self.runner.can_admit_goal():
+                    rec = self.runner.tasks.claim_next()   # atomic pending -> running
+                    if rec is None:
+                        break
                     if not self.runner._setup_done:
                         self.runner.setup()
-                    th = self.runner.submit(rec["goal"], force_mode="swarm", record=rec)
-                    if th is not None:
-                        self.runner.emit("manager",
-                                         text=f"starting queued task: {rec['goal'][:60]}")
+                    th = self.runner.submit_goal(rec)
+                    if th is None:
+                        # already in flight (shouldn't happen) — undo the claim
+                        self.runner.tasks.requeue(rec["id"])
+                        break
+                    self.runner.emit("manager",
+                                     text=f"starting queued task: {rec['goal'][:60]}")
 
         now = time.time()
         if self.runner.tasks.has_unfinished() and now - self._last_eval >= self.interval_s:

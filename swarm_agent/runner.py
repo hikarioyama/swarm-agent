@@ -27,6 +27,7 @@ not the old static ``--gate 4`` the TUI used to pass (1/8 of the operating point
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -76,6 +77,20 @@ User message:
 {message}
 """
 
+BTW_PROMPT = """You are swarm-agent answering a quick side question ("by the way") about
+your CURRENT situation — asked while you may be in the middle of other work. You and the
+parallel workers are one swarm mind, so report the whole swarm's state honestly, warmly,
+and briefly.
+
+Current situation:
+{situation}
+
+The user's side question:
+{question}
+
+Answer directly and concisely in the user's language, grounded in the situation above. If
+the situation shows nothing running, just say so."""
+
 # How many prior turns to feed the router/chat agent for continuity.
 _HISTORY_TURNS = 6
 # R3: hard cap on retained turns so the resent-every-turn history never grows unbounded
@@ -120,10 +135,23 @@ class SwarmRunner:
     def __init__(self, *, gate_start: Optional[int] = None,
                  admission: str = "aimd", warm: bool = True) -> None:
         self.events: "queue.Queue[dict]" = queue.Queue()
+        from .logbook import SwarmLogger
+        self.log = SwarmLogger()
+        self.log.event("session_start",
+                       max_goals=int(config.MAX_CONCURRENT_GOALS),
+                       model=config.MODEL, base_url=config.BASE_URL,
+                       gate_start=int(gate_start or config.DECODE_GATE_START),
+                       admission=admission,
+                       sandbox_isolate=getattr(compat, "_SANDBOX_ISOLATE", None),
+                       auto_approve=os.environ.get("FLEET_AUTO_APPROVE", "1"))
         self.gate: Optional[compat.DecodeGate] = None
         self.history: list[tuple[str, str]] = []   # (role, text)
-        self.busy = False
-        self._busy_lock = threading.Lock()   # R1: non-blocking guard around the busy flag
+        self._active: dict[str, object] = {}   # in-flight turns: rec_id -> Thread; "_interactive" sentinel for a typed turn
+        self._busy_lock = threading.RLock()
+        self._history_lock = threading.Lock()  # guard shared history across concurrent goal turns
+        self._max_goals = int(config.MAX_CONCURRENT_GOALS)
+        from .scheduler import GoalScheduler
+        self._goals = GoalScheduler(self._max_goals)
 
         self._controller = None
         self._setup_done = False
@@ -141,8 +169,32 @@ class SwarmRunner:
         self._manager = CompletionManager(self)
 
     # ── events ────────────────────────────────────────────────────────────────
+    def _publish(self, ev: dict) -> None:
+        """Single publish path: persist the event to the logbook, then enqueue it for the
+        UI. Every emit() and every fleet task event goes through here so the JSONL log is a
+        complete record (PARALLEL_GOALS / debugging)."""
+        self.log.log(ev)
+        self.events.put(ev)
+
     def emit(self, kind: str, **kw) -> None:
-        self.events.put({"kind": kind, **kw})
+        self._publish({"kind": kind, **kw})
+
+    @property
+    def busy(self) -> bool:
+        """True iff ANY turn (interactive or queued goal) is in flight. Derived from the
+        in-flight registry so the UI badge + reentry guard keep working unchanged."""
+        return len(self._active) > 0
+
+    @busy.setter
+    def busy(self, value: bool) -> None:
+        # Compat shim for callers/tests that set busy directly: True injects the interactive
+        # sentinel, False clears it. Internal code manipulates self._active directly under
+        # _busy_lock and does NOT go through this setter.
+        with self._busy_lock:
+            if value:
+                self._active.setdefault("_interactive", None)
+            else:
+                self._active.pop("_interactive", None)
 
     # ── one-time runtime setup (lazy: paid on the first turn) ───────────────────
     def setup(self) -> None:
@@ -200,6 +252,11 @@ class SwarmRunner:
             except Exception:
                 pass
             self._controller = None
+        try:
+            self.log.event("session_end")
+            self.log.close()
+        except Exception:
+            pass
 
     # ── public API ──────────────────────────────────────────────────────────────
     def enqueue_task(self, goal: str) -> dict:
@@ -213,17 +270,25 @@ class SwarmRunner:
                record=None) -> Optional[threading.Thread]:
         """Run one user turn on a background daemon thread; returns it (None if busy).
 
-        R1 (TOCTOU): claim the busy flag SYNCHRONOUSLY here under a non-blocking lock
-        BEFORE spawning the thread. If already busy, return None (caller treats that as
-        'rejected, still working') instead of racing a second turn-thread past the old
-        check-then-act. ``force_mode`` ∈ {None, "chat", "swarm"} skips the router.
+        R1 (TOCTOU): claim the interactive slot SYNCHRONOUSLY here under a non-blocking
+        lock BEFORE spawning the thread. If already occupied, return None (caller treats
+        that as 'rejected, still working') instead of racing a second turn-thread past the
+        old check-then-act. ``force_mode`` ∈ {None, "chat", "swarm"} skips the router.
         """
         with self._busy_lock:
-            if self.busy:
+            if "_interactive" in self._active:
+                return None                          # one typed turn at a time, always
+            # Respect the shared K cap too: an interactive turn occupies one of the K slots
+            # (everything shares one policy — §4.5), so at K=1 it must NOT start alongside a
+            # running queued goal. ATOMIC under _busy_lock, restoring the old "return None
+            # while at capacity" contract (the TUI also gates on busy, this is the backstop).
+            if len(self._active) >= self._max_goals:
                 return None
-            self.busy = True
+            self._active["_interactive"] = None
         t = threading.Thread(target=self._run_turn, args=(message, force_mode, record),
                              name="swarm-turn", daemon=True)
+        with self._busy_lock:
+            self._active["_interactive"] = t
         t.start()
         return t
 
@@ -260,12 +325,16 @@ class SwarmRunner:
                         self._record_reply(reply)
             except self._ServerDown as e:                # R2: typed server-down error
                 if record is not None:
-                    # An unreachable server is an INFRA failure, not a task failure —
-                    # do NOT burn the attempt budget (which would permanently fail the
-                    # goal after a few transient outages, defeating "always complete").
-                    # Requeue it; the manager only re-dispatches once the server is back
-                    # (it probes before dispatch), so this never tight-loops.
-                    self.tasks.requeue(record["id"])
+                    # Distinguish a genuinely UNREACHABLE server (infra → requeue WITHOUT
+                    # burning the attempt budget; the manager retries once it is back) from
+                    # a request-level API error that merely surfaces as _ServerDown while
+                    # the server is UP. The latter must burn the budget — otherwise a
+                    # persistently-failing goal requeues forever with attempts stuck at 0
+                    # (an infinite re-dispatch loop). Probe to tell them apart.
+                    if metrics.scrape(config.METRICS_URL, timeout=0.3) is None:
+                        self.tasks.requeue(record["id"])
+                    else:
+                        self.tasks.fail(record["id"], str(e))
                 self.emit("error", text=(
                     "inference server unreachable / API failed — "
                     f"{e}. Check the Step-3.7 endpoint and retry."))
@@ -275,10 +344,85 @@ class SwarmRunner:
                 self.emit("error", text=f"{type(e).__name__}: {e}",
                           detail=traceback.format_exc())
             finally:
-                with self._busy_lock:                    # R1: clear under the same guard
-                    self.busy = False
+                with self._busy_lock:
+                    self._active.pop("_interactive", None)
                 self.emit("idle")
                 self._wake.set()
+
+    def active_goal_ids(self) -> set[str]:
+        """Ids of in-flight QUEUED goal turns (excludes the interactive sentinel)."""
+        with self._busy_lock:
+            return {k for k in self._active if k != "_interactive"}
+
+    def can_admit_goal(self) -> bool:
+        """True iff the manager may dispatch another queued goal: under the K cap AND no
+        writer is executing or waiting (writers drain everything first — §4.4).
+
+        The cap counts EVERY in-flight turn — queued goals AND an interactive turn (the
+        ``_interactive`` sentinel). Everything shares one K-slot policy (§4.5), so at K=1
+        a typed turn occupies the single slot and no queued goal starts alongside it:
+        byte-for-byte the old "dispatch only when not busy" behaviour (DoD §9). At K>1 an
+        interactive turn is simply one of the K concurrent slots."""
+        with self._busy_lock:
+            n = len(self._active)
+        return (n < self._max_goals
+                and not self._goals.writer_active
+                and not self._goals.writer_pending)
+
+    def submit_goal(self, rec) -> Optional[threading.Thread]:
+        """Spawn a daemon thread running one QUEUED goal turn. The rec is already in
+        'running' state (claim_next did the atomic transition). Returns the thread, or None
+        if this goal id is already in flight OR admitting it would exceed the K cap (the
+        manager then re-queues it). Concurrency-safe; does NOT take _run_lock.
+
+        The cap is enforced ATOMICALLY here under _busy_lock — not just via the manager's
+        pre-check — so a turn that starts during a slow setup()/warmup window (between
+        claim_next and here) cannot push the active set past FLEET_MAX_CONCURRENT_GOALS."""
+        rid = rec["id"]
+        with self._busy_lock:
+            if rid in self._active:
+                return None
+            if len(self._active) >= self._max_goals:
+                return None
+            self._active[rid] = None
+        t = threading.Thread(target=self._run_goal_turn, args=(rec,),
+                             name=f"swarm-goal-{rid}", daemon=True)
+        with self._busy_lock:
+            self._active[rid] = t
+        t.start()
+        return t
+
+    def _run_goal_turn(self, rec) -> None:
+        rid = rec["id"]
+        self.emit("user", text=rec["goal"], goal_id=rid)
+        self._append_history("user", rec["goal"])
+        try:
+            if not self._setup_done:
+                self.setup()
+            ok, out = self._run_swarm(rec["goal"], goal_id=rid)
+            if ok:
+                self.tasks.complete(rid, out)
+            else:
+                self.tasks.fail(rid, out)
+        except self._ServerDown as e:
+            # Same infra-vs-API distinction as _run_turn: unreachable server -> requeue
+            # without burning budget; API error while server is up -> fail (burn budget).
+            if metrics.scrape(config.METRICS_URL, timeout=0.3) is None:
+                self.tasks.requeue(rid)
+            else:
+                self.tasks.fail(rid, str(e))
+            self.emit("error", text=(
+                "inference server unreachable / API failed — "
+                f"{e}. Check the Step-3.7 endpoint and retry."), goal_id=rid)
+        except Exception as e:
+            self.tasks.fail(rid, str(e))
+            self.emit("error", text=f"{type(e).__name__}: {e}",
+                      detail=traceback.format_exc(), goal_id=rid)
+        finally:
+            with self._busy_lock:
+                self._active.pop(rid, None)
+            self.emit("idle", goal_id=rid)
+            self._wake.set()
 
     def _record_reply(self, text: str) -> None:
         text = (text or "").strip() or "…"
@@ -287,12 +431,34 @@ class SwarmRunner:
 
     def _append_history(self, role: str, text: str) -> None:
         """R3: append a (role, text) turn and trim to a bounded tail."""
-        self.history.append((role, text))
-        if len(self.history) > _HISTORY_CAP:
-            del self.history[:-_HISTORY_CAP]
+        with self._history_lock:
+            self.history.append((role, text))
+            if len(self.history) > _HISTORY_CAP:
+                del self.history[:-_HISTORY_CAP]
 
     class _ServerDown(Exception):
         """Raised when run_conversation reports the inference server unreachable / API failed."""
+
+    def ask_status(self, question: str, situation: str) -> None:
+        """Answer a side ("btw") question about the CURRENT situation via an INDEPENDENT
+        worker. Runs on its OWN daemon thread and does NOT take ``_run_lock`` or set
+        ``busy`` — so it answers even while a swarm turn is mid-flight. Emits a ``btw``
+        event with the answer (or a clean note on failure); never raises to the caller."""
+        def _run():
+            try:
+                prompt = BTW_PROMPT.format(
+                    situation=(situation or "(idle — nothing is running right now)"),
+                    question=question)
+                ans = self._run_agent("router", prompt, "btw",
+                                      max_iterations=1, max_tokens=1024)
+                self.emit("btw", text=ans, question=question)
+            except self._ServerDown as e:
+                self.emit("btw", text=f"(couldn't reach the model: {e})",
+                          question=question)
+            except Exception as e:
+                self.emit("btw", text=f"(btw failed: {type(e).__name__}: {e})",
+                          question=question)
+        threading.Thread(target=_run, name="swarm-btw", daemon=True).start()
 
     def _run_agent(self, lane: str, prompt: str, task_id: str, *,
                    max_iterations: int = 1, max_tokens: int = 1024) -> str:
@@ -334,9 +500,30 @@ class SwarmRunner:
         prompt = CHAT_PROMPT.format(history=self._history_snippet(), message=message)
         return self._run_agent("router", prompt, "chat", max_iterations=1, max_tokens=2048)
 
+    def _await_abandoned_writers(self, goal_id) -> None:
+        """Before a WRITING goal starts, wait (bounded) for any still-alive ABANDONED write
+        worker from an earlier timed-out goal to finish — its subprocess can't be killed, so
+        running now could race it and corrupt the workspace. Proceeds with a loud warning if it
+        outlives the bound (never a permanent stall)."""
+        from fleet import engine as _engine
+        wait_s = float(getattr(config, "ABANDONED_WRITER_WAIT_S", 0) or 0)
+        if wait_s <= 0 or not _engine.abandoned_writers_alive():
+            return
+        self.emit("status", text="waiting for an abandoned write worker to finish before "
+                  "starting this writing goal", goal_id=goal_id)
+        deadline = time.monotonic() + wait_s
+        while _engine.abandoned_writers_alive():
+            if time.monotonic() >= deadline:
+                msg = ("proceeding with a writing goal while an abandoned write worker is "
+                       "STILL alive (waited %.0fs) — possible workspace race" % wait_s)
+                self.emit("error", text=msg, goal_id=goal_id)
+                self.log.event("abandoned_writer_wait_timeout", goal_id=goal_id, waited_s=wait_s)
+                return
+            time.sleep(0.5)
+
     # ── swarm: plan → board → ThreadFleet → final deliverable ────────────────────
-    def _run_swarm(self, goal_text: str) -> tuple[bool, str]:
-        self.emit("planning")
+    def _run_swarm(self, goal_text: str, *, goal_id: Optional[str] = None) -> tuple[bool, str]:
+        self.emit("planning", goal_id=goal_id)
         try:
             tasks = self._plan(goal_text)
         except ValueError as e:
@@ -346,9 +533,22 @@ class SwarmRunner:
             # _run_turn's typed handler.)
             self.emit("error", text=(
                 "couldn't turn that into a task plan — try rephrasing, narrowing it, "
-                "or use /chat for a direct answer."), detail=f"plan parse failed: {e}")
+                "or use /chat for a direct answer."), detail=f"plan parse failed: {e}",
+                goal_id=goal_id)
             return (False, "plan parse failed")
-        self.emit("planned", n=len(tasks), tasks=[
+
+        # Classify BEFORE acquiring an execution permit (planning ran un-permitted /
+        # concurrent). read-only -> shared reader slot; writing -> exclusive (§4.2).
+        kind = goal_mod.classify_plan(tasks)
+        readonly = (kind == "read-only")
+
+        # Namespace a QUEUED goal's task ids by its record id so concurrent goals never
+        # share a task id (per-worker sandbox cwd collision) (§4.3). Interactive turns
+        # (goal_id is None) keep their ids — at most one interactive turn runs at a time.
+        if goal_id is not None:
+            tasks = goal_mod.namespace_tasks(tasks, goal_id)
+
+        self.emit("planned", n=len(tasks), goal_id=goal_id, tasks=[
             {"id": t.id, "lane": t.lane, "deps": list(t.deps), "prompt": t.prompt[:160]}
             for t in tasks
         ])
@@ -357,10 +557,25 @@ class SwarmRunner:
         board.add_many(tasks)
 
         def push(kind, tid, counts=None, **extra):
-            self.events.put({"kind": "task", "event": kind, "id": tid,
-                             "counts": counts or {}, **extra})
+            self._publish({"kind": "task", "event": kind, "id": tid,
+                           "counts": counts or {}, "goal_id": goal_id, **extra})
 
-        out = ThreadFleet(board, self.gate, cfg=config, on_event=push).run()
+        # Acquire the shared/exclusive permit for the fleet execution ONLY (not planning),
+        # then run, then release (context manager). This is what bounds write goals to
+        # exclusive and read-only goals to ≤K concurrent (§4.1/4.2).
+        # Writing goals (exclusive) also get a PRIVATE sandbox root so their coder workers'
+        # ephemeral cwd cannot clobber an interactive turn's or another goal's (§4.3).
+        import contextlib as _contextlib
+        import tempfile as _tempfile
+        if readonly:
+            sb_ctx = _contextlib.nullcontext()
+        else:
+            sb_ctx = compat.sandbox_root(
+                _tempfile.mkdtemp(prefix=f"swarm-goal-{(goal_id or 'turn')}-"))
+        with self._goals.permit(readonly=readonly), sb_ctx:
+            if not readonly:
+                self._await_abandoned_writers(goal_id)
+            out = ThreadFleet(board, self.gate, cfg=config, on_event=push).run()
         final = goal_mod.final_result(out.get("board_results", {}))
         counts = out.get("counts") or {}
         stats = {
@@ -371,7 +586,7 @@ class SwarmRunner:
             "unfinished": out.get("unfinished"),
         }
         if final and final.strip():
-            self.emit("final", text=final, stats=stats)
+            self.emit("final", text=final, stats=stats, goal_id=goal_id)
             self._append_history("assistant", final)
             return (True, final)
         else:
@@ -380,14 +595,32 @@ class SwarmRunner:
             self.emit("error", text=(
                 "swarm produced no final deliverable "
                 f"(done={counts.get('done')}, failed={counts.get('failed')}, "
-                f"unfinished={out.get('unfinished')})"), stats=stats)
+                f"unfinished={out.get('unfinished')})"), stats=stats, goal_id=goal_id)
             return (False, "swarm produced no final deliverable")
 
     def _plan(self, goal_text: str):
-        text = self._run_agent("planner",
-                               goal_mod.PLANNER_PROMPT.format(goal=goal_text),
-                               "plan", max_iterations=2, max_tokens=4096)
-        return goal_mod.parse_plan(text)
+        """Plan the goal into a task DAG, RETRYING on a malformed plan.
+
+        Planning runs at reasoning_effort='none' (fast), which occasionally emits invalid
+        JSON or a mis-wired DAG (e.g. a leaf left unconnected, though validate_tasks now
+        auto-wires those). A couple of cheap retries recover such a slip instead of failing
+        the whole goal with "plan parse failed". ``_ServerDown`` is NOT caught here — it
+        propagates to the typed handler. Raises the last ValueError if every attempt fails.
+        """
+        prompt = goal_mod.PLANNER_PROMPT.format(goal=goal_text)
+        last: Optional[ValueError] = None
+        for _ in range(3):
+            # Generous output cap: a whole task-DAG JSON must land in ONE generation. A small
+            # cap truncated big plans → truncation→continuation→max-iteration churn ("planning
+            # loops for minutes"). See config.PLANNER_MAX_TOKENS.
+            text = self._run_agent("planner", prompt, "plan",
+                                   max_iterations=config.PLANNER_MAX_ITERATIONS,
+                                   max_tokens=config.PLANNER_MAX_TOKENS)
+            try:
+                return goal_mod.parse_plan(text)
+            except ValueError as e:
+                last = e
+        raise last
 
     # ── helpers ──────────────────────────────────────────────────────────────────
     def _history_snippet(self) -> str:

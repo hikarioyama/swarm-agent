@@ -228,6 +228,28 @@ _NO_CONTINUE = os.environ.get("FLEET_NO_CONTINUE", "0") not in ("0", "false", "F
 # token reasoning that never fits a cap. Unset by default (real fleets keep reasoning).
 _REASONING_EFFORT = os.environ.get("FLEET_REASONING_EFFORT") or None
 
+# Per-lane reasoning effort. Step-3.7 emits a multi-thousand-token <think> block by
+# DEFAULT, which overflows each call's max_tokens and forces a truncation→continuation
+# re-prefill loop + max-iteration summaries — the "research/planning seems to loop" symptom
+# (measured: a single research goal took ~115 s, ~42 s of it just the planner churning).
+# Bounding the reasoning effort per lane cut that SAME goal to ~11 s with NO quality loss:
+#   * planner / router / manager → 'none'  — structured/short output (JSON DAG, route,
+#     assessment); they do not need to ruminate, so answer directly in one generation.
+#   * every other lane (workers + reducer) → 'low' — keep SOME reasoning for tool use and
+#     synthesis quality, but bounded so a sub-task can't churn for 90 s.
+# Precedence: FLEET_REASONING_<LANE> env (e.g. FLEET_REASONING_CODER=high) > the pinned
+# 'none' lanes > global FLEET_REASONING_EFFORT (workers/reducer) > the 'low' default.
+_DIRECT_LANES = {"planner": "none", "router": "none", "manager": "none"}
+
+
+def _lane_reasoning(lane: str):
+    env = os.environ.get(f"FLEET_REASONING_{lane.upper()}")
+    if env:
+        return env
+    if lane in _DIRECT_LANES:
+        return _DIRECT_LANES[lane]
+    return _REASONING_EFFORT or "low"
+
 
 def _neutralize_length(result) -> None:
     """Rewrite finish_reason 'length' -> 'stop' on a forwarder return (streaming mock
@@ -285,10 +307,13 @@ def apply(gate=_UNSET) -> None:
         def _wrap(orig):
             def inner(self, *args, **kwargs):
                 lane = getattr(self, "_fleet_lane", "worker")
-                if _REASONING_EFFORT and args and isinstance(args[0], dict):
+                eff = _lane_reasoning(lane)
+                if eff and args and isinstance(args[0], dict):
                     # inject into a COPY of api_kwargs (don't mutate the loop's dict, which
                     # it may reuse on retry); flows into both streaming and non-streaming.
-                    args = (dict(args[0], reasoning_effort=_REASONING_EFFORT),) + args[1:]
+                    # Per-lane: planner/router/manager → 'none' (no truncation→continuation
+                    # churn); other lanes use the global FLEET_REASONING_EFFORT default.
+                    args = (dict(args[0], reasoning_effort=eff),) + args[1:]
                 ctx = _GATE.acquire(lane) if _GATE is not None else _null_gate(lane)
                 gw0 = time.perf_counter()
                 with ctx:
@@ -366,6 +391,27 @@ def new_session_id(task_id: str = "") -> str:
 # no-tool throughput sweep is unaffected; tool-using fleets want it ON).
 _SANDBOX_ISOLATE = os.environ.get("FLEET_SANDBOX_ISOLATE", "1") not in ("0", "false", "False")
 _SANDBOX_ROOT = os.environ.get("FLEET_SANDBOX_ROOT") or None  # None => system tempdir
+
+
+@contextlib.contextmanager
+def sandbox_root(path):
+    """Temporarily point per-worker sandboxes at ``path`` (a private build dir). A WRITING
+    goal uses this so its coder workers' ephemeral cwd lives under a private root, isolated
+    from interactive turns / other goals' artifacts (PARALLEL_GOALS_PLAN §4.3). Safe because
+    writing goals run EXCLUSIVELY (no other fleet runs concurrently), so mutating this
+    module-global for the writer's fleet cannot race another fleet. No-op when path is falsy.
+    NOTE: only RELATIVE cwd is isolated — absolute-path writes the planner emits still land
+    where told; exclusivity is what actually prevents cross-goal write races."""
+    global _SANDBOX_ROOT
+    if not path:
+        yield
+        return
+    prev = _SANDBOX_ROOT
+    _SANDBOX_ROOT = path
+    try:
+        yield
+    finally:
+        _SANDBOX_ROOT = prev
 
 
 def _hermes_sandbox_api():

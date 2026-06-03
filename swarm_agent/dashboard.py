@@ -274,3 +274,150 @@ class SwarmView:
             cells[pos] = "█"
             return "".join(cells)
         return "·" * w                                      # pending / retry
+
+
+class MultiSwarmView:
+    """Routes goal_id-tagged events to per-goal ``SwarmView``s and paints the right panel.
+
+    With ≤1 active goal it DELEGATES to a single ``SwarmView`` (byte-for-byte the old layout —
+    no visual regression). With 2+ goals running concurrently it paints a compact multi-goal
+    panel: one block per goal (goal text · done/total · running) over the shared metrics
+    footer (PARALLEL_GOALS_PLAN §4.6). Events route by ``ev["goal_id"]`` (None == the
+    interactive typed turn); a sub-view is retired when its turn ends (``idle``).
+    """
+
+    _INTERACTIVE = "_interactive"   # key for the goal_id=None (typed-turn) sub-view
+
+    def __init__(self) -> None:
+        self.views: dict[str, SwarmView] = {}
+        self._order: list[str] = []          # goal keys, most-recently-active LAST
+        self._default = SwarmView()          # rendered when nothing is active (idle main worker)
+
+    # ── ingest ───────────────────────────────────────────────────────────────
+    def _key(self, ev: dict) -> str:
+        return ev.get("goal_id") or self._INTERACTIVE
+
+    def _view(self, key: str) -> SwarmView:
+        v = self.views.get(key)
+        if v is None:
+            v = self.views[key] = SwarmView()
+            self._order.append(key)
+        elif key in self._order:
+            self._order.remove(key)
+            self._order.append(key)          # bump recency
+        return v
+
+    def ingest(self, ev: dict) -> None:
+        kind = ev.get("kind")
+        # Only swarm/turn-scoped events map to a sub-view (reply/queued/manager/route/etc.
+        # are chat-pane chrome and never touch the swarm panel).
+        if kind not in ("user", "planning", "planned", "task", "final", "error", "idle"):
+            return
+        key = self._key(ev)
+        v = self._view(key)
+        if kind == "user":
+            v.goal = (ev.get("text") or "")[:48]   # label the sub-view with its goal text
+        v.ingest(ev)
+        if kind == "idle":                          # turn fully ended -> retire the sub-view
+            self.views.pop(key, None)
+            if key in self._order:
+                self._order.remove(key)
+
+    # ── accessors used by the App / _situation_snapshot ─────────────────────────
+    def active_views(self) -> list[tuple[str, SwarmView]]:
+        """(key, view) for live sub-views, most-recently-active FIRST."""
+        return [(k, self.views[k]) for k in reversed(self._order) if k in self.views]
+
+    def goal_label(self, goal_id) -> str:
+        """Goal text for a goal_id (for chat tagging); '' if unknown."""
+        v = self.views.get(goal_id or self._INTERACTIVE)
+        return v.goal if v else ""
+
+    @property
+    def goal(self) -> str:
+        av = self.active_views()
+        return av[0][1].goal if av else self._default.goal
+
+    @goal.setter
+    def goal(self, value: str) -> None:
+        # back-compat shim (the App set self.swarm.goal on 'planned'): set it on the most-
+        # recent active view, else the default.
+        av = self.active_views()
+        (av[0][1] if av else self._default).goal = value
+
+    # ── render ───────────────────────────────────────────────────────────────
+    def render(self, add, geom, *, palette, gate_limit, running, kv_pct, tok_s,
+               elapsed=0, busy=False, phase="", queue=None) -> None:
+        active = self.active_views()
+        if len(active) <= 1:                         # single-swarm fallback — today's layout
+            view = active[0][1] if active else self._default
+            view.render(add, geom, palette=palette, gate_limit=gate_limit, running=running,
+                        kv_pct=kv_pct, tok_s=tok_s, elapsed=elapsed, busy=busy,
+                        phase=phase, queue=queue)
+            return
+        self._render_multi(active, add, geom, palette=palette, gate_limit=gate_limit,
+                           running=running, kv_pct=kv_pct, tok_s=tok_s, elapsed=elapsed,
+                           queue=queue)
+
+    def _render_multi(self, active, add, geom, *, palette, gate_limit, running, kv_pct,
+                      tok_s, elapsed, queue) -> None:
+        top, left, bottom, right = geom
+        width = max(4, right - left)
+
+        def put(y, text, key="fg", x=None):
+            xx = left if x is None else x
+            if top <= y <= bottom and right - xx > 0:
+                add(y, xx, _fit(text, right - xx), palette.get(key, 0))
+
+        def rule(y):
+            if top <= y <= bottom:
+                add(y, left, "─" * width, palette["dim"])
+
+        # title + live badge
+        badge = "● live"
+        title = f"swarm · {len(active)} goals"
+        if bottom >= top:
+            add(top, left, _fit(title, max(0, width - _dwidth(badge) - 1)), palette["gold"])
+            add(top, max(left, right - _dwidth(badge)), badge, palette["run"])
+        rule(top + 1)
+
+        # shared metrics footer (same two lines + optional queue line as SwarmView)
+        tok = f"{tok_s:.0f}" if tok_s else "–"
+        put(bottom, f"{tok} tok/s · {int(elapsed)}s", "dim")
+        put(bottom - 1, f"gate {gate_limit} · run {running} · kv {kv_pct}", "dim")
+        rule(bottom - 2)
+        sec_end = bottom - 3
+        if queue and queue.get("total"):
+            p, r = queue.get("pending", 0), queue.get("running", 0)
+            d, f = queue.get("done", 0), queue.get("failed", 0)
+            text = f"QUEUE · {p} pending · {r} running · {d} done"
+            if f:
+                text += f" · {f} failed"
+            put(sec_end, text, "err" if f else "dim")
+            sec_end -= 1
+
+        # one compact block (2 rows) per active goal, most-recent first; budget-aware.
+        y = top + 2
+        shown = 0
+        for key, v in active:
+            if y + 1 > sec_end:                      # need 2 rows for a full block
+                break
+            c = v.counts or {}
+            done = c.get("done", 0)
+            total = len(v.order) or sum(
+                c.get(k, 0) for k in ("pending", "ready", "running", "done", "failed"))
+            run = sum(1 for t in v.tasks.values() if t.get("state") == "running")
+            label = v.goal or ("(typed turn)" if key == self._INTERACTIVE else key)
+            put(y, f"▸ {label}", "gold")
+            y += 1
+            meta = f"  done {done}/{total} · run {run}"
+            if c.get("failed"):
+                meta += f" · failed {c['failed']}"
+            if v.stranded:
+                meta += f" · stranded {v.stranded}"
+            put(y, meta, "err" if (c.get("failed") or v.stranded) else "dim")
+            y += 1
+            shown += 1
+        hidden = len(active) - shown
+        if hidden > 0 and y <= sec_end:
+            put(y, f"  +{hidden} more goal(s)", "dim")

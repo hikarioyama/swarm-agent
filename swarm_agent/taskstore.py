@@ -75,6 +75,24 @@ class TaskStore:
                     return dict(rec)
         return None
 
+    def claim_next(self) -> dict | None:
+        """Atomically claim the oldest pending goal: pending -> running, returns a copy.
+
+        Single locked transition (vs next_pending() + mark_running()) so two concurrent
+        dispatchers can never claim the same goal (PARALLEL_GOALS_PLAN §4.3). Returns None
+        when nothing is pending.
+        """
+        with self._lock:
+            for rec in self._records:
+                if rec.get("state") == "pending":
+                    now = time.time()
+                    rec["state"] = "running"
+                    rec["started_at"] = now
+                    rec["progress_at"] = now
+                    self._persist()
+                    return dict(rec)
+        return None
+
     def mark_running(self, tid: str) -> None:
         with self._lock:
             rec = self._find(tid)
