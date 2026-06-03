@@ -346,6 +346,9 @@ class SwarmRunner:
             finally:
                 with self._busy_lock:
                     self._active.pop("_interactive", None)
+                    idle = not self._active
+                if idle:
+                    compat.reset_interject()     # no steer leaks into the next turn
                 self.emit("idle")
                 self._wake.set()
 
@@ -421,6 +424,9 @@ class SwarmRunner:
         finally:
             with self._busy_lock:
                 self._active.pop(rid, None)
+                idle = not self._active
+            if idle:
+                compat.reset_interject()         # no steer leaks into the next turn
             self.emit("idle", goal_id=rid)
             self._wake.set()
 
@@ -459,6 +465,24 @@ class SwarmRunner:
                 self.emit("btw", text=f"(btw failed: {type(e).__name__}: {e})",
                           question=question)
         threading.Thread(target=_run, name="swarm-btw", daemon=True).start()
+
+    # ── mid-flight interject (deliver a typed message INTO a running turn) ────────
+    def steer(self, text: str) -> int:
+        """Inject a user message into the turn(s) currently in flight WITHOUT stopping
+        them (HermesAgent /steer). Fans out to every live agent — planner, fleet workers,
+        reducer, persona — and is stashed so agents that start later this turn (e.g. the
+        reducer) also see it. Returns how many live agents it reached right now."""
+        n = compat.steer_all(text)
+        self.emit("steer", text=text, reached=n)
+        return n
+
+    def interrupt(self, message: Optional[str] = None) -> int:
+        """Hard-interrupt every live agent's tool-calling loop (HermesAgent interrupt).
+        Stops in-flight generation/tools so the turn unwinds quickly. Returns how many
+        agents were signalled."""
+        n = compat.interrupt_all(message)
+        self.emit("interrupt", reached=n)
+        return n
 
     def _run_agent(self, lane: str, prompt: str, task_id: str, *,
                    max_iterations: int = 1, max_tokens: int = 1024) -> str:

@@ -169,6 +169,85 @@ _GATE: Optional[DecodeGate] = None
 _apply_lock = threading.Lock()
 _UNSET = object()  # sentinel: apply() without a gate arg must NOT clobber the installed gate
 
+# ── mid-flight interject (HermesAgent /steer + interrupt) ───────────────────────
+# Every agent in the swarm — front-door persona, planner, reducer AND fleet workers —
+# is an AIAgent built by make_agent() and runs via run_conversation(). We register each
+# one for the lifetime of that call (apply() wraps run_conversation), so the TUI can
+# deliver a typed message INTO the running turn without stopping it (steer) or hard-stop
+# the tool loop (interrupt). _PENDING_STEER carries steers typed in a gap (planning, or
+# before the reducer starts) forward to agents that start later — cleared by the runner
+# on idle so nothing leaks into the next turn.
+_LIVE_AGENTS: "set" = set()
+_LIVE_LOCK = threading.RLock()
+_PENDING_STEER: "list[str]" = []
+_STEER_LOCK = threading.RLock()
+
+
+def live_agents() -> list:
+    """Snapshot of agents currently inside run_conversation (thread-safe)."""
+    with _LIVE_LOCK:
+        return list(_LIVE_AGENTS)
+
+
+def _register_agent(agent) -> None:
+    with _LIVE_LOCK:
+        _LIVE_AGENTS.add(agent)
+
+
+def _unregister_agent(agent) -> None:
+    with _LIVE_LOCK:
+        _LIVE_AGENTS.discard(agent)
+
+
+def _drain_pending_steer_into(agent) -> None:
+    """Apply steers stashed before this agent started (reducer / late workers)."""
+    with _STEER_LOCK:
+        pend = list(_PENDING_STEER)
+    for s in pend:
+        try:
+            agent.steer(s)
+        except Exception:
+            pass
+
+
+def steer_all(text: str) -> int:
+    """Inject a user message into every live agent's NEXT tool result (HermesAgent
+    /steer) and stash it for agents that start later this turn. Does NOT stop any
+    in-flight work. Returns how many currently-live agents accepted it."""
+    text = (text or "").strip()
+    if not text:
+        return 0
+    with _STEER_LOCK:
+        _PENDING_STEER.append(text)
+    n = 0
+    for a in live_agents():
+        try:
+            if a.steer(text):
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+def interrupt_all(message: Optional[str] = None) -> int:
+    """Hard-interrupt every live agent's tool-calling loop (HermesAgent interrupt).
+    Returns how many agents were signalled."""
+    n = 0
+    for a in live_agents():
+        try:
+            a.interrupt(message)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def reset_interject() -> None:
+    """Drop any stashed steers — called by the runner when it goes fully idle so a steer
+    can never leak into the next, unrelated turn."""
+    with _STEER_LOCK:
+        _PENDING_STEER.clear()
+
 
 def _ensure_hermes_on_path() -> None:
     if config.HERMES_DIR not in sys.path:
@@ -334,6 +413,23 @@ def apply(gate=_UNSET) -> None:
 
         A._interruptible_api_call = _wrap(A._interruptible_api_call)
         A._interruptible_streaming_api_call = _wrap(A._interruptible_streaming_api_call)
+
+        # Register/unregister each agent for the duration of its conversation so the TUI
+        # can steer/interrupt it mid-flight (see steer_all / interrupt_all). A steer typed
+        # before this agent started (stashed in _PENDING_STEER) is applied on entry.
+        def _wrap_conv(orig):
+            def inner(self, *args, **kwargs):
+                _register_agent(self)
+                _drain_pending_steer_into(self)
+                try:
+                    return orig(self, *args, **kwargs)
+                finally:
+                    _unregister_agent(self)
+            inner.__name__ = getattr(orig, "__name__", "run_conversation")
+            inner.__wrapped__ = orig
+            return inner
+
+        A.run_conversation = _wrap_conv(A.run_conversation)
         A._fleet_patched = True
 
 

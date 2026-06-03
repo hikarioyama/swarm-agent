@@ -9,7 +9,7 @@ parsing, bounded history, and the busy admission guard.
 from __future__ import annotations
 
 from fleet import compat, prompts
-from swarm_agent.tui import parse_command, _disp_width, _hard_break, ChatLog
+from swarm_agent.tui import parse_command, _disp_width, _hard_break, _cursor_rowcol, ChatLog
 from swarm_agent.dashboard import SwarmView, _GLYPH
 from swarm_agent.runner import SwarmRunner, _parse_route, _HISTORY_CAP
 from swarm_agent.taskstore import TaskStore
@@ -36,6 +36,32 @@ def test_composer_hard_break_keeps_ascii_and_cjk_inside_width() -> None:
         assert len(lines) > 1
         assert "".join(lines) == text
         assert all(_disp_width(line) <= width for line in lines)
+
+
+# ── caret placement under wrapping (arrow-key cursor movement) ────────────────
+def test_cursor_rowcol_ascii_single_line() -> None:
+    assert _cursor_rowcol("hello", 0, 40) == (0, 0)      # start
+    assert _cursor_rowcol("hello", 3, 40) == (0, 3)      # mid
+    assert _cursor_rowcol("hello", 5, 40) == (0, 5)      # end
+
+
+def test_cursor_rowcol_cjk_counts_two_cells() -> None:
+    # caret after 2 wide glyphs sits at column 4, not 2.
+    assert _cursor_rowcol("あいうえ", 2, 40) == (0, 4)
+    assert _cursor_rowcol("aあb", 2, 40) == (0, 3)       # ascii + wide before caret
+
+
+def test_cursor_rowcol_wraps_to_next_row() -> None:
+    # width 4 → "abcd" fills row 0; caret at index 4 lands on a fresh row.
+    assert _cursor_rowcol("abcdef", 4, 4) == (1, 0)
+    assert _cursor_rowcol("abcdef", 5, 4) == (1, 1)
+    # caret at the very end of a full last line spills onto its own row (matches draw()).
+    assert _cursor_rowcol("abcd", 4, 4) == (1, 0)
+
+
+def test_cursor_rowcol_clamps_out_of_range() -> None:
+    assert _cursor_rowcol("abc", -3, 40) == (0, 0)
+    assert _cursor_rowcol("abc", 99, 40) == (0, 3)
 
 
 # ── chat log wrapping ─────────────────────────────────────────────────────────
@@ -455,5 +481,89 @@ def test_idle_keeps_global_status_while_another_goal_runs(tmp_path, monkeypatch)
         app.pump()
         assert not app.runner.busy
         assert (app.message, app.started_at, app.phase) == ("ready", None, "")
+    finally:
+        app.runner.shutdown()
+
+
+# ── mid-flight interject (steer / interrupt) ──────────────────────────────────
+class _FakeAgent:
+    """Stand-in for an AIAgent: records steer/interrupt calls (steer returns accepted)."""
+    def __init__(self) -> None:
+        self.steers: list = []
+        self.interrupts: list = []
+
+    def steer(self, text: str) -> bool:
+        self.steers.append(text)
+        return True
+
+    def interrupt(self, message=None) -> None:
+        self.interrupts.append(message)
+
+
+def test_compat_steer_fans_out_and_stashes_for_late_agents() -> None:
+    a, b = _FakeAgent(), _FakeAgent()
+    compat._register_agent(a)
+    compat._register_agent(b)
+    try:
+        assert compat.steer_all("focus on tests") == 2
+        assert a.steers == ["focus on tests"] and b.steers == ["focus on tests"]
+        # an agent that STARTS after the steer (reducer / late worker) drains the stash
+        late = _FakeAgent()
+        compat._drain_pending_steer_into(late)
+        assert late.steers == ["focus on tests"]
+        assert compat.steer_all("   ") == 0          # empty steer ignored
+    finally:
+        compat._unregister_agent(a)
+        compat._unregister_agent(b)
+        compat.reset_interject()
+    fresh = _FakeAgent()                              # after reset → nothing leaks forward
+    compat._drain_pending_steer_into(fresh)
+    assert fresh.steers == []
+
+
+def test_compat_interrupt_fans_out_to_live_agents() -> None:
+    a = _FakeAgent()
+    compat._register_agent(a)
+    try:
+        assert compat.interrupt_all("stop now") == 1
+        assert a.interrupts == ["stop now"]
+    finally:
+        compat._unregister_agent(a)
+
+
+def test_runner_steer_emits_event_and_reaches_live_agent() -> None:
+    a = _FakeAgent()
+    compat._register_agent(a)
+    r = SwarmRunner()
+    try:
+        assert r.steer("also handle errors") == 1
+        assert a.steers == ["also handle errors"]
+        evs = []
+        while True:
+            try:
+                evs.append(r.events.get_nowait())
+            except Exception:
+                break
+        steer_evs = [e for e in evs if e.get("kind") == "steer"]
+        assert len(steer_evs) == 1
+        assert steer_evs[0]["reached"] == 1 and steer_evs[0]["text"] == "also handle errors"
+    finally:
+        compat._unregister_agent(a)
+        compat.reset_interject()
+        r.shutdown()
+
+
+def test_dispatch_busy_plain_interjects_and_forced_queues(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SWARM_TASKS_PATH", str(tmp_path / "tasks.json"))
+    from swarm_agent.tui import App
+    app = App(None)
+    try:
+        app.runner.busy = True                        # simulate a turn in flight
+        steered: list = []
+        monkeypatch.setattr(app.runner, "steer", lambda t: steered.append(t) or 1)
+        app._dispatch("tweak the plan", None)         # plain → interject, not queued
+        assert steered == ["tweak the plan"] and app.pending == []
+        app._dispatch("a fresh question", "chat")     # explicit /chat → queued as new turn
+        assert app.pending == [("a fresh question", "chat")]
     finally:
         app.runner.shutdown()

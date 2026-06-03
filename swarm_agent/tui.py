@@ -34,20 +34,22 @@ LOGO = [
 ]
 HELP = [
     "plain message   router auto-decides: chat reply vs swarm fan-out",
-    "/swarm GOAL     force the swarm to decompose GOAL into a parallel DAG",
-    "/chat  MSG      force one direct single-agent reply",
+    "plain (mid-run) INTERJECT into the running turn — the model sees it next iteration",
+    "/stop           interrupt the running turn (stops in-flight generation/tools)",
+    "/swarm GOAL     force the swarm to decompose GOAL into a parallel DAG (queues if busy)",
+    "/chat  MSG      force one direct single-agent reply (queues if busy)",
     "/task GOAL      queue a goal; the completion manager runs it to done",
     "/tasks          list the persistent task queue",
     "/btw <q>        ask an INDEPENDENT worker about the current situation (works mid-run)",
     "mouse drag      select chat text and copy it (the status panel is left alone)",
     "/copy [last]    also copy the conversation (or last reply) to the clipboard",
     "Ctrl+Y          copy the last reply to the clipboard",
+    "←→ Ctrl+A/E     move the caret in the composer (Del/Backspace edit at the caret)",
     "↑↓ PgUp PgDn    scroll the conversation (Home/End jump to oldest/newest)",
     "/clear          clear the conversation",
     "/gate N         set the decode-gate floor (throughput)",
     "/help           show this help",
     "/quit           exit  (Ctrl+D)",
-    "no mid-run stop — a turn runs to completion; Ctrl+D ends the session",
 ]
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -160,6 +162,27 @@ def _hard_break(token: str, width: int) -> list[str]:
     return pieces or [""]
 
 
+def _cursor_rowcol(text: str, cursor: int, width: int) -> tuple[int, int]:
+    """Map a caret char-index into ``(row, col_cells)`` for ``_hard_break`` wrapping.
+
+    Replays the same cell-width split so the on-screen caret lands exactly where the
+    next typed glyph will appear — including the trailing empty line that ``draw``
+    appends when the last wrapped line is full.
+    """
+    cursor = max(0, min(cursor, len(text)))
+    row, col = 0, 0
+    for i, ch in enumerate(text):
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if col and col + cw > width:        # piece boundary (mirrors _hard_break)
+            row, col = row + 1, 0
+        if i == cursor:
+            return row, col
+        col += cw
+    if col and col >= width:                # caret past a full last line → fresh row
+        return row + 1, 0
+    return row, col
+
+
 def _wrap_cells(text: str, width: int) -> list[str]:
     """Word-wrap ``text`` to at most ``width`` DISPLAY cells per line.
 
@@ -233,6 +256,7 @@ class ChatLog:
     _STYLE = {                                  # kind -> (palette-key, first-prefix, cont-prefix)
         "user":      ("gold", "❯ ", "  "),
         "assistant": ("fg",   "  ", "  "),
+        "steer":     ("run",  "↪ ", "  "),
         "btw":       ("run",  "btw › ", "      "),
         "status":    ("dim",  "· ", "  "),
         "error":     ("err",  "✗ ", "  "),
@@ -295,6 +319,7 @@ class App:
         self.swarm = MultiSwarmView()
         self.meter = metrics.ThroughputMeter()
         self.input = ""
+        self.cursor = 0           # caret position within self.input (0..len)
         self.show_help = False
         self.message = "type a goal, or /help"
         self.started_at: float | None = None
@@ -373,6 +398,13 @@ class App:
             elif kind == "reply":
                 self.chat.add("assistant", ev.get("text", ""))
                 self.phase = ""
+            elif kind == "steer":
+                # A typed message delivered INTO the running turn — show it inline so the
+                # user sees what they injected and that it landed.
+                self.chat.add("steer", ev.get("text", ""))
+                self.scroll = 0
+            elif kind == "interrupt":
+                self.chat.add("status", f"⛔ interrupt sent to {ev.get('reached', 0)} agent(s)")
             elif kind == "btw":
                 self.chat.add("btw", ev.get("text", ""))
             elif kind == "final":
@@ -452,6 +484,12 @@ class App:
                 for rec in snapshot:
                     self.chat.add(
                         "status", f"[{rec['state']}] {rec['id']} · {rec['goal'][:60]}")
+        elif command in {"stop", "interrupt"}:
+            if self.runner.busy:
+                n = self.runner.interrupt()
+                self.message = f"⛔ interrupting {n} running agent(s)…"
+            else:
+                self.message = "nothing is running"
         elif command == "btw":
             if not argument:
                 self.message = "usage: /btw <question about the current situation>"
@@ -478,8 +516,16 @@ class App:
             self.message = "nothing to send"
             return
         if self.runner.busy:
-            # A turn is running — QUEUE this message instead of dropping it, so the user
-            # can fire several in a row; they run in order as each turn finishes.
+            if force_mode is None:
+                # Plain message while a turn is running → INTERJECT it into the live work
+                # (HermesAgent /steer): the model sees it on its next tool iteration without
+                # losing the work in progress. Explicit /swarm or /chat still queue below.
+                n = self.runner.steer(text)
+                self.message = (f"↪ interjected into {n} running agent(s)" if n else
+                                "↪ interjected — will reach the next agent that starts")
+                return
+            # Explicit /swarm or /chat — the user wants a NEW turn; queue it to run in order
+            # as each turn finishes (use /stop to interrupt the current one instead).
             self.pending.append((text, force_mode))
             self.message = f"queued · {len(self.pending)} waiting (runs when ready)"
             return
@@ -651,17 +697,21 @@ class App:
         else:
             # Keep transient command feedback (queued / cleared / gate …) visible here,
             # since the status rule that used to show self.message is gone.
-            hint = ("working… no mid-run stop · Ctrl+D ends the session"
+            hint = ("working… type to interject · /stop to interrupt · Ctrl+D quits"
                     if busy else (self.message or "Type a goal or /help"))
             self._safe(comp_top, 3, _fit(hint, comp_w), pal["dim"])
         self._safe(h - 1, 1,
-                   "Enter send · ↑↓ scroll · drag to select & copy · /help · Ctrl+D quit",
+                   "Enter send · type mid-run to interject · /stop interrupt · ↑↓ scroll · /help",
                    pal["dim"])
         try:
             curses.curs_set(1)
-            # T3: position the cursor by DISPLAY width, not len(); CJK glyphs are 2 cells.
-            cur_y = comp_top + n_comp - 1
-            cur_x = min(w - 2, 3 + _disp_width(comp_lines[-1]))
+            # T3: position the caret by DISPLAY width, not len(); CJK glyphs are 2 cells.
+            # Map the caret's char-index to a wrapped (row, col), then into the visible
+            # window (input_lines is tail-clipped to comp_lines), so ←/→ track on screen.
+            cur_row, cur_col = _cursor_rowcol(self.input, self.cursor, comp_w)
+            vis_row = cur_row - (len(input_lines) - n_comp)
+            cur_y = comp_top + max(0, min(n_comp - 1, vis_row))
+            cur_x = min(w - 2, 3 + cur_col)
             self.stdscr.move(cur_y, cur_x)
         except curses.error:
             pass
@@ -732,16 +782,28 @@ class App:
                 if key == "\x04":                       # Ctrl+D
                     return 0
                 if key == "\x1b":                       # Esc
-                    self.input = ""
+                    self.input, self.cursor = "", 0
                     self.show_help = False
                 elif key in (curses.KEY_ENTER, "\n", "\r"):
-                    text, self.input = self.input, ""
+                    text, self.input, self.cursor = self.input, "", 0
                     if not self.submit(text):
                         return 0
                 elif key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
-                    self.input = self.input[:-1]
+                    if self.cursor > 0:                  # delete the glyph before the caret
+                        self.input = self.input[:self.cursor - 1] + self.input[self.cursor:]
+                        self.cursor -= 1
+                elif key == curses.KEY_DC:               # Delete → glyph at the caret
+                    self.input = self.input[:self.cursor] + self.input[self.cursor + 1:]
                 elif key == "\x15":                      # Ctrl+U
-                    self.input = ""
+                    self.input, self.cursor = "", 0
+                elif key == curses.KEY_LEFT:             # caret: one glyph left
+                    self.cursor = max(0, self.cursor - 1)
+                elif key == curses.KEY_RIGHT:            # caret: one glyph right
+                    self.cursor = min(len(self.input), self.cursor + 1)
+                elif key == "\x01":                      # Ctrl+A → start of input
+                    self.cursor = 0
+                elif key == "\x05":                      # Ctrl+E → end of input
+                    self.cursor = len(self.input)
                 elif key == "\x19":                      # Ctrl+Y → copy last reply
                     self._copy(last_only=True)
                 elif key == curses.KEY_UP:               # scroll conversation: older
@@ -757,7 +819,8 @@ class App:
                 elif key == curses.KEY_END:              # jump back to the live tail
                     self.scroll = 0
                 elif isinstance(key, str) and key.isprintable():
-                    self.input += key
+                    self.input = self.input[:self.cursor] + key + self.input[self.cursor:]
+                    self.cursor += 1
         finally:
             self.runner.shutdown()
             self._restore_output()
