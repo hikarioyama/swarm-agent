@@ -89,6 +89,22 @@ class CompletionManager:
             self._last_eval = now
             self._evaluate(now)
 
+        # Periodic skill curator: only when IDLE (no queued work, no live turn) so it never
+        # competes with the swarm, and only if the server is up (the consolidation pass runs
+        # an LLM). should_run_now() self-gates to its own weekly interval, so this check is
+        # cheap to make every heartbeat.
+        if not self.runner.tasks.has_unfinished() and not self.runner.busy:
+            try:
+                from .skills import curator as _cur
+                if _cur.should_run_now() and self._server_ok():
+                    from .skills.llm import make_proposer
+                    threading.Thread(
+                        target=lambda: _cur.run_curator(make_proposer()),
+                        name="swarm-curator", daemon=True).start()
+                    self.runner.emit("manager", text="running skill curator (idle maintenance)")
+            except Exception as e:
+                self.runner.log.event("manager_error", error=f"curator: {e!r}")
+
     def _server_ok(self) -> bool:
         """Fast probe: is the inference server reachable? Defensive (False on error)."""
         try:

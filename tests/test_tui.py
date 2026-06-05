@@ -299,10 +299,11 @@ def test_language_policy_targets_user_facing_lanes_only() -> None:
     assert "日本語" in prompts.lane_system_prompt("reducer")
     assert "日本語" not in (prompts.lane_system_prompt("router") or "")
     assert "日本語" not in prompts.lane_system_prompt("coder")
-    # front-door reply prompts carry the directive AND still .format cleanly (no stray braces)
-    assert "日本語" in CHAT_PROMPT.format(history="h", message="m")
+    # front-door reply prompts carry the directive AND still .format cleanly (no stray braces).
+    # CHAT/ROUTER now also take a {recall} slot (LanceDB hybrid recall injection; "" when none).
+    assert "日本語" in CHAT_PROMPT.format(history="h", message="m", recall="")
     assert "日本語" in BTW_PROMPT.format(situation="s", question="q")
-    assert "日本語" in ROUTER_PROMPT.format(history="h", message="m")
+    assert "日本語" in ROUTER_PROMPT.format(history="h", message="m", recall="")
 
 
 def test_unknown_lane_system_prompt_uses_worker_framing() -> None:

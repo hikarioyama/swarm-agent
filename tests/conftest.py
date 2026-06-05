@@ -4,6 +4,13 @@ import tempfile
 
 import pytest
 
+# Isolate recall (LanceDB) state BEFORE swarm_agent.recall is imported (it reads these at
+# module load). Default OFF so the unit suite never loads the CPU embedder or touches the
+# real ~/.cache store; a recall test can override SWARM_RECALL=1 + a temp SWARM_RECALL_PATH.
+os.environ.setdefault("SWARM_RECALL", "0")
+os.environ.setdefault("SWARM_RECALL_PATH",
+                      str(pathlib.Path(tempfile.gettempdir()) / "swarm-test-recall.lance"))
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _isolate_swarm_state():
@@ -18,3 +25,9 @@ def _isolate_swarm_state():
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+@pytest.fixture
+def path(tmp_path):
+    """SQLite board tests expect a string DB path, matching their script-mode calls."""
+    return str(tmp_path / "board.db")

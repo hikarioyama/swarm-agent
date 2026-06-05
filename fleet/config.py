@@ -231,26 +231,37 @@ def lane_priority(lane: str) -> int:
 
 
 # ── Agent ROSTER: heterogeneous context / role / count over the KV budget ─────
-# KV (1,625,950 fp8 tokens) is a shared budget. Under the stateless-completions model
-# (recon fact #2) resident KV ≈ concurrent-DECODING count × per-turn tokens, NOT enrolled
-# count — so the gate (not the roster) is what bounds KV. The roster sizes role mix + the
-# decode-priority waterfall; see fleet/roster.py for both the resident and the (pessimistic)
-# enrolled views.
-KV_BUDGET = 1_625_950
+# KV (3,228,856 nvfp4-KV tokens; was 1,625,950 fp8) is a shared budget. Under the
+# stateless-completions model (recon fact #2) resident KV ≈ concurrent-DECODING count ×
+# per-turn tokens, NOT enrolled count — so the gate (not the roster) is what bounds KV. The
+# roster sizes role mix + the decode-priority waterfall; see fleet/roster.py for both the
+# resident and the (pessimistic) enrolled views.
+# 2026-06-05: backend is now Step3.7 NVFP4 + NVFP4-KV (B2 in-kernel V de-swizzle) at
+# util0.92 / max-len262144 / max-seqs128 — live-measured pool 3,228,856 tok (1.99x the old
+# fp8 budget). The bigger pool buys longer-context tenants + more prefix-cache retention
+# (re-prefill avoidance for the stateless full-resend model); it does NOT raise the decode
+# knee (compute-bound at C32-64, gate ceiling 96), so the gate/AIMD params are unchanged.
+KV_BUDGET = 3_228_856
 
 ROSTER = {
+    # 2026-06-05: per-turn `context` bumped to realistic sizes (worker 8K->32K, reducer
+    # 16K->32K, router 2K->4K). These are KV-ACCOUNTING estimates of a typical turn's
+    # transcript, NOT enforced caps (no context_length is passed to make_agent; a worker may
+    # grow to the server max_model_len 262144). The old 8K underestimated real code work — a
+    # single large file read blows past it. Honest against the 3.23M nvfp4-KV pool: enrolled
+    # worst-case ~2.03M = 63%, still leaving ~1.2M for prefix cache + 256K interactive/Studio.
     # role:      context  count  tools                                  duty  flags / note
     "director": dict(context=131072, count=1,  tools=["todo"],                   duty=0.15,
                      persistent=True,
                      note="long-horizon steerer; 1 persistent agent holding goal+plan+state, board-driven, OFF the hot loop"),
     "planner":  dict(context=32768,  count=2,  tools=["todo"],                   duty=0.50,
                      note="goal -> task DAG; bursty, high value"),
-    "reducer":  dict(context=16384,  count=6,  tools=[],                         duty=0.70,
+    "reducer":  dict(context=32768,  count=6,  tools=[],                         duty=0.70,
                      note="tree fan-in; near-root reducers grow toward larger context"),
-    "worker":   dict(context=8192,   count=48, tools=["file", "terminal", "search"], duty=0.40,
+    "worker":   dict(context=32768,  count=48, tools=["file", "terminal", "search"], duty=0.40,
                      elastic=True,
                      note="the BULK; ephemeral lean coders, measured C32-64 operating point (count = decode target)"),
-    "router":   dict(context=2048,   count=16, tools=[],                         duty=0.20,
+    "router":   dict(context=4096,   count=16, tools=[],                         duty=0.20,
                      note="classify/route; near-free, high churn"),
 }
 

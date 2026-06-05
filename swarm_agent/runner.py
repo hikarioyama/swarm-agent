@@ -40,6 +40,8 @@ from fleet.board import Board
 from fleet.engine import ThreadFleet
 from fleet.worker import _final_text
 from . import goal as goal_mod
+from . import recall as _recall
+from .skills import synth as _skills_synth
 from .taskstore import TaskStore
 
 
@@ -61,7 +63,7 @@ reply text follows the language rule above):
 or
   {{"mode":"swarm"}}
 
-Recent conversation (oldest first):
+{recall}Recent conversation (oldest first):
 {history}
 
 User message:
@@ -74,7 +76,7 @@ never refuse to talk about how you work. Plain text, no preamble.
 
 """ + _prompts.LANGUAGE_DIRECTIVE + """
 
-Recent conversation (oldest first):
+{recall}Recent conversation (oldest first):
 {history}
 
 User message:
@@ -152,6 +154,11 @@ class SwarmRunner:
                        auto_approve=os.environ.get("FLEET_AUTO_APPROVE", "1"))
         self.gate: Optional[compat.DecodeGate] = None
         self.history: list[tuple[str, str]] = []   # (role, text)
+        # Persistent conversation recall (LanceDB hybrid): the in-process history is
+        # trimmed to _HISTORY_CAP, but every turn is also indexed here so the front door /
+        # planner can REFERENCE older turns on demand instead of forgetting them.
+        self._recall = _recall.get_store()
+        self._turn_idx = 0                          # monotonic id source for the recall index
         self._active: dict[str, object] = {}   # in-flight turns: rec_id -> Thread; "_interactive" sentinel for a typed turn
         self._busy_lock = threading.RLock()
         self._history_lock = threading.Lock()  # guard shared history across concurrent goal turns
@@ -209,6 +216,9 @@ class SwarmRunner:
                 return
             self.emit("boot", text="warming swarm runtime…")
             self.gate = compat.DecodeGate(self._gate_start)
+            # Warm the recall store (load the CPU embedder + open LanceDB + backfill from
+            # prior session logs) off the hot path so the first turn isn't blocked.
+            self._recall.warm_async()
             # Install the gate-aware forwarder + decode timers ONCE, process-global.
             compat.apply(self.gate)
             # Kill the cold-start cache stampede before any fan-out.
@@ -442,11 +452,26 @@ class SwarmRunner:
         self._append_history("assistant", text)
 
     def _append_history(self, role: str, text: str) -> None:
-        """R3: append a (role, text) turn and trim to a bounded tail."""
+        """R3: append a (role, text) turn and trim to a bounded tail. Also index the turn
+        into the persistent recall store (fire-and-forget) so the trimmed tail is never
+        truly forgotten — older turns stay retrievable via hybrid search."""
         with self._history_lock:
             self.history.append((role, text))
             if len(self.history) > _HISTORY_CAP:
                 del self.history[:-_HISTORY_CAP]
+            idx = self._turn_idx
+            self._turn_idx += 1
+        self._recall.add_async(role, text, getattr(self.log, "sid", "default"), idx)
+
+    def _recall_prefix(self, query: str) -> str:
+        """A prompt-ready block of relevant EARLIER turns (excluding the recent snippet
+        already shown), or "". Fail-soft: any error → "" (never breaks the front door)."""
+        try:
+            recent = [t for _, t in self.history[-_HISTORY_TURNS:]]
+            blk = self._recall.block(query, exclude_texts=recent)
+            return (blk + "\n\n") if blk else ""
+        except Exception:
+            return ""
 
     class _ServerDown(Exception):
         """Raised when run_conversation reports the inference server unreachable / API failed."""
@@ -514,7 +539,8 @@ class SwarmRunner:
 
     # ── router: one cheap call returns (mode, reply-if-chat) ─────────────────────
     def _route(self, message: str) -> tuple[str, str]:
-        prompt = ROUTER_PROMPT.format(history=self._history_snippet(), message=message)
+        prompt = ROUTER_PROMPT.format(history=self._history_snippet(), message=message,
+                                      recall=self._recall_prefix(message))
         text = self._run_agent("router", prompt, "route", max_iterations=1, max_tokens=1024)
         data = _parse_route(text)
         if data and data.get("mode") == "swarm":
@@ -527,7 +553,8 @@ class SwarmRunner:
         return ("swarm-fallback", "")
 
     def _chat(self, message: str) -> str:
-        prompt = CHAT_PROMPT.format(history=self._history_snippet(), message=message)
+        prompt = CHAT_PROMPT.format(history=self._history_snippet(), message=message,
+                                    recall=self._recall_prefix(message))
         return self._run_agent("router", prompt, "chat", max_iterations=1, max_tokens=2048)
 
     def _await_abandoned_writers(self, goal_id) -> None:
@@ -618,6 +645,12 @@ class SwarmRunner:
         if final and final.strip():
             self.emit("final", text=final, stats=stats, goal_id=goal_id)
             self._append_history("assistant", final)
+            # Auto-generate a skill from this outcome if it taught something reusable
+            # (fire-and-forget; conservative; never blocks or breaks the turn).
+            try:
+                _skills_synth.synthesize_async(goal_text, final)
+            except Exception:
+                pass
             return (True, final)
         else:
             # Reducer failed / produced nothing — surface a clean error, never an
@@ -637,7 +670,7 @@ class SwarmRunner:
         the whole goal with "plan parse failed". ``_ServerDown`` is NOT caught here — it
         propagates to the typed handler. Raises the last ValueError if every attempt fails.
         """
-        prompt = goal_mod.PLANNER_PROMPT.format(goal=goal_text)
+        prompt = self._recall_prefix(goal_text) + goal_mod.PLANNER_PROMPT.format(goal=goal_text)
         last: Optional[ValueError] = None
         for _ in range(3):
             # Generous output cap: a whole task-DAG JSON must land in ONE generation. A small
