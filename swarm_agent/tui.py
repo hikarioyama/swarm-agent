@@ -28,9 +28,15 @@ from .dashboard import SwarmView, MultiSwarmView
 LOG_PATH = Path(os.environ.get(
     "SWARM_LOG", str(Path.home() / ".cache" / "swarm-agent" / "runtime.log")))
 
+# ASCII-only banner (figlet "small"). Box-drawing / block glyphs are East-Asian
+# "Ambiguous" width, so a CJK-locale terminal renders them 2 cells wide and the
+# logo shears apart; plain ASCII is Narrow everywhere and stays aligned.
 LOGO = [
-    "  ▄▄▄ █  █ █▀█ █▀█ █▀▄▀█   ▄▀█ █▀▀ █▀▀ █▄ █ ▀█▀",
-    "  ▄██ ▀▄▀▄▀ █▀█ █▀▄ █ ▀ █   █▀█ █▄█ ██▄ █ ▀█  █ ",
+    '                                              _',
+    ' ____ __ ____ _ _ _ _ __    __ _ __ _ ___ _ _| |_',
+    "(_-< V  V / _` | '_| '  \\  / _` / _` / -_) ' \\  _|",
+    '/__/\\_/\\_/\\__,_|_| |_|_|_| \\__,_\\__, \\___|_||_\\__|',
+    '                                |___/',
 ]
 HELP = [
     "plain message   router auto-decides: chat reply vs swarm fan-out",
@@ -731,11 +737,11 @@ class App:
         top, left, bottom, right = geom
         width = right - left
         y = top + 1
-        if width >= max(len(s) for s in LOGO) and bottom - top > 8:
+        if width >= max(len(s) for s in LOGO) and bottom - top > 9:
             for line in LOGO:
                 self._safe(y, left, line, pal["gold"]); y += 1
             y += 1
-        self._safe(y, left, "起動即スワーム — type a goal and the planner fans it", pal["dim"])
+        self._safe(y, left, "Swarm on startup - type a goal and the planner fans it", pal["dim"])
         self._safe(y + 1, left, "out across dozens of agents; small talk gets a", pal["dim"])
         self._safe(y + 2, left, "direct reply.  /help for commands.", pal["dim"])
 
