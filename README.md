@@ -1,5 +1,12 @@
 # swarm-agent
 
+> ⚠️ **Status: early, work-in-progress, and held together with tape.**
+> This is a personal research harness under active and messy development —
+> expect rough edges, half-finished features, breaking changes without notice,
+> thin tests, and the occasional thing that is outright broken. It is shared
+> as-is, with **no stability or support guarantees**. Poke around and learn from
+> it, but don't build anything load-bearing on it yet.
+
 A standalone **high-concurrency swarm harness** for Step-3.7-Flash. It reuses
 HermesAgent's `run_agent.AIAgent` as a runtime module but owns its orchestration,
 CLI, board, scheduling, and admission control outside the HermesAgent repo.
