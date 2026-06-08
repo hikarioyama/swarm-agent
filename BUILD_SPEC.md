@@ -193,7 +193,7 @@ Against the live `:8001` Step-3.7 server (load OK):
 - **D. Dynamic admission:** AIMD converges the gate into the knee band and **backs off** when KV>85%
   / preemptions rise (induce it by pushing the limit high) without thrashing or deadlock.
 - **E. Duty measured:** report real per-worker `decode_s/tool_s` and fleet duty = mean(running)/enrolled
-  — closes DESIGN §6 "実 duty 未測".
+  — closes DESIGN §6 "actual duty unmeasured".
 - **F. Prefix-warm:** worker #1 of each role shows a prefix-cache hit (server `prefix_cache_hits_total`
   rises on warm; first real worker's prefill is cheap).
 - **G. Restart-safety:** SQLite board survives a mid-run kill and resumes remaining tasks.

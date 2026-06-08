@@ -16,6 +16,45 @@ Use `/goal TEXT` to save a planner goal without launching it, then `/run` to
 launch it explicitly. Other commands include `/mode invaders`, `/gate 32`,
 `/stop`, and `/help`.
 
+## What's in the box
+
+The `swarm_agent` package is the goal-driven front door; the `fleet` package is
+the measured concurrency engine underneath it.
+
+- **Conversational front door** (`swarm_agent/runner.py`) — an in-process router
+  that turns a plain message into either a chat reply or a planned goal, then
+  drives the fleet engine. No separate server process.
+- **Planner + DAG** (`swarm_agent/goal.py`) — decomposes a goal into a task DAG
+  (lanes: writer / coder / researcher / analyst / reviewer / reducer …) with an
+  auto-repair pass that promotes a stray integration sink to `reducer`.
+- **Parallel goal consumption** (`swarm_agent/scheduler.py`) — a reader-writer,
+  K-capped scheduler runs read-only goals concurrently while serializing
+  writing goals. Opt in with `FLEET_MAX_CONCURRENT_GOALS` (default 1 =
+  legacy behaviour). See `swarm_agent/PARALLEL_GOALS_PLAN.md`.
+- **Persistent task queue + completion manager** (`swarm_agent/taskstore.py`) —
+  a durable `~/.cache/swarm-agent/tasks.json` queue with a background manager
+  that drives queued goals to completion.
+- **Conversation recall** (`swarm_agent/recall.py`) — a LanceDB hybrid
+  (vector + BM25/FTS, CPU embeddings) store with JST time-window filters so the
+  front door and planner can reference older turns instead of forgetting them.
+  Fully fail-soft; disable with `SWARM_RECALL=0`.
+- **Skill system** (`swarm_agent/skills/`) — self-contained skill synthesis on
+  goal completion plus a weekly self-improving curator. The model proposes a
+  structured plan and the harness applies it; no model-callable tools are added.
+  Disable with `SWARM_SKILL_SYNTH=0` / `SWARM_CURATOR=0`.
+- **Event log + web UI** (`swarm_agent/logbook.py`, `swarm_agent/webui/`) —
+  every event is persisted as JSONL; a read-only FastAPI sidecar tails it and
+  streams a live force-graph of the running DAG to the browser. The swarm core
+  is never modified by the sidecar. See `swarm_agent/webui/PROTOCOL.md`.
+
+### Subcommands
+```bash
+swarm                     # curses TUI (default)
+swarm <tasks.jsonl> ...   # run a DAG / planner goal through the fleet engine
+swarm logs [--errors|--tail N|--all|--path]   # inspect the persistent event log
+swarm webui [--port 8765] [--replay <events-*.jsonl>]   # read-only graph UI
+```
+
 ## Why
 
 Single-stream Step-3.7 is ~125 tok/s; the GPU only earns its keep with **dozens of
@@ -118,3 +157,9 @@ Reproduce the operating point: `python scripts/throughput_probe.py --gate 32`.
 - **C96+** — needs an N-proportional warm-up to measure as steady state (gate MAX is 96).
 - **Tree reduction** — log-depth fan-in reducers (the board supports it; not yet a helper).
 - **Ungated summary path** — iteration-limit summary generations bypass the gate (rare; review #9, deferred).
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE). The bundled `swarm_agent/webui/static/vendor/d3.v7.min.js`
+is third-party software under the ISC License (see `NOTICE`).
