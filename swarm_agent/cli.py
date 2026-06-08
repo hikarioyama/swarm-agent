@@ -121,6 +121,9 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "logs":
         return _logs_main(argv[1:])
+    if argv and argv[0] == "webui":
+        from .webui.__main__ import main as webui_main
+        return webui_main(argv[1:])
     if not argv or argv == ["tui"]:
         from .tui import main as tui_main
         return tui_main()

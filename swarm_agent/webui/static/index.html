@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>swarm-agent · live view</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<!-- top control bar -->
+<header id="bar">
+  <span class="brand">swarm<b>view</b></span>
+  <span id="conn" class="pill off">offline</span>
+
+  <span class="grp">
+    <button id="mode-live"   class="seg on">live</button>
+    <button id="mode-replay" class="seg">replay</button>
+  </span>
+
+  <span class="grp replay-only">
+    <select id="session" title="session log"></select>
+    <button id="rp-play" title="play / pause">▶</button>
+    <select id="rp-speed" title="speed">
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+      <option value="4">4×</option>
+      <option value="16">16×</option>
+    </select>
+    <input id="rp-scrub" type="range" min="0" max="0" value="0" step="1">
+    <span id="rp-pos" class="mono">0 / 0</span>
+  </span>
+
+  <span class="spacer"></span>
+  <button id="fit" title="fit to view">fit</button>
+</header>
+
+<!-- metrics HUD -->
+<div id="hud">
+  <div><label>gate</label><b id="m-gate">–</b></div>
+  <div><label>run</label><b id="m-run">–</b></div>
+  <div><label>wait</label><b id="m-wait">–</b></div>
+  <div><label>kv</label><b id="m-kv">–</b></div>
+  <div><label>tok/s</label><b id="m-tok">–</b></div>
+</div>
+
+<!-- legend -->
+<div id="legend">
+  <div class="lg-row" id="lg-lanes"></div>
+  <div class="lg-row" id="lg-states"></div>
+</div>
+
+<!-- node tooltip -->
+<div id="tip" hidden></div>
+
+<script src="/static/vendor/d3.v7.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

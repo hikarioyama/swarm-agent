@@ -23,26 +23,36 @@ from . import config
 # the SAME quantity) would push kv past 1.0 and pin the AIMD gate at MIN forever
 # (review fix #1). We therefore MAX percent gauges across label sets and resolve the two
 # kv aliases to ONE source.
+# Engine-agnostic: vLLM and SGLang expose the same quantities under different metric names.
+# We map BOTH name spaces to one internal key set so scrape() works against either backend
+# (only one engine's names are present at a time, so the aliases never collide). SGLang names
+# verified against the live sglang.launch_server /metrics on SM120 (sglang:* prefix).
 _COUNT_GAUGES = {
     "vllm:num_requests_running": "running",
     "vllm:num_requests_waiting": "waiting",
+    "sglang:num_running_reqs": "running",   # SGLang == concurrent generations
+    "sglang:num_queue_reqs": "waiting",     # SGLang queued (not yet decoding)
 }
 # percent/ratio gauges: take the MAX across label sets, never the sum.
 _PERCENT_GAUGES = {
     "vllm:kv_cache_usage_perc": "kv",
     "vllm:gpu_cache_usage_perc": "kv",   # older vLLM name == same quantity (alias)
+    "sglang:token_usage": "kv",          # SGLang KV-pool usage fraction (0..1)
 }
 # Preferred source per percent key, in priority order: the first present alias wins, so a
 # second alias for the SAME quantity never double-counts. (kv_cache_usage_perc preferred;
 # gpu_cache_usage_perc is the older name and only a fallback.)
 _PERCENT_PREFERRED = {
-    "kv": ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"),
+    "kv": ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc", "sglang:token_usage"),
 }
 _COUNTERS = {
     "vllm:num_preemptions_total": "preemptions",
     "vllm:generation_tokens_total": "gen_tokens",
     "vllm:prefix_cache_hits_total": "prefix_hits",
     "vllm:prefix_cache_queries_total": "prefix_queries",
+    "sglang:generation_tokens_total": "gen_tokens",   # SGLang cumulative gen tokens
+    "sglang:cached_tokens_total": "prefix_hits",       # best-effort prefix/radix-cache hits
+    "sglang:prompt_tokens_total": "prefix_queries",    # denominator proxy (verify on live)
 }
 
 
