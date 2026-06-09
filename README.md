@@ -18,7 +18,8 @@ built.
 Run `swarm` with no arguments to open the Hermes-inspired curses TUI. It can
 launch the small demo, the invaders specialist DAG, or a free-form planner goal
 while showing the live transcript and server metrics. The `❯` composer accepts
-input immediately and sends normal messages through the planner front door.
+input immediately and sends normal messages through the planner front door;
+it supports multi-line input (Shift+Enter inserts a newline).
 Use `/goal TEXT` to save a planner goal without launching it, then `/run` to
 launch it explicitly. Other commands include `/mode invaders`, `/gate 32`,
 `/stop`, and `/help`.
@@ -54,6 +55,32 @@ the measured concurrency engine underneath it.
   streams a live force-graph of the running DAG to the browser. The swarm core
   is never modified by the sidecar. See `swarm_agent/webui/PROTOCOL.md`.
 
+### v2 — self-managing parallel swarm
+
+These build on the front door above to run *multiple* goals at once, safely, and
+to drive them without a human babysitting the TUI. Design notes:
+[`swarm_agent/SWARM_V2_CONCEPT.md`](swarm_agent/SWARM_V2_CONCEPT.md).
+
+- **Parallel writes via git worktrees** (`swarm_agent/worktree.py`) — each
+  writing goal runs in its own isolated git worktree and is merged back
+  sequentially, so several writers make progress concurrently without clobbering
+  each other (structured conflict handling; park + escalate on conflict). This
+  also fixes the relative-path/sandbox-isolation problem, since each worktree is
+  a real checkout. Opt in with `FLEET_PARALLEL_WRITES`.
+- **Inter-goal dependency DAG** (`swarm_agent/goal.py`, `swarm_agent/taskstore.py`)
+  — at enqueue time an LLM pass infers semantic dependencies between queued
+  goals, and a dep-aware `claim_next` runs independent goals in parallel while
+  ordering dependent ones. Includes deadlock detection.
+- **Self-managing manager** (`swarm_agent/audit.py`) — the background completion
+  manager (180 s tick) audits in-flight goals, performs **bounded** auto-repair
+  on hung work, and escalates exactly once when it cannot recover on its own.
+- **Telegram mirror** (`swarm_agent/telegram/`) — an in-process, fully
+  bidirectional mirror of the live TUI session (same process, not a separate bot
+  session). Outbound events tail the event log; inbound phone messages route as
+  TUI input (submit / steer / enqueue / interrupt). Enable by exporting
+  `SWARM_TELEGRAM_TOKEN` plus a `SWARM_TELEGRAM_CHAT_IDS` allowlist; unset leaves
+  it a complete no-op. No HermesAgent dependency.
+
 ### Subcommands
 ```bash
 swarm                     # curses TUI (default)
@@ -61,6 +88,20 @@ swarm <tasks.jsonl> ...   # run a DAG / planner goal through the fleet engine
 swarm logs [--errors|--tail N|--all|--path]   # inspect the persistent event log
 swarm webui [--port 8765] [--replay <events-*.jsonl>]   # read-only graph UI
 ```
+
+### Configuration
+
+All optional; defaults preserve the original single-goal behaviour.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `FLEET_MAX_CONCURRENT_GOALS` | `1` | Parallel goal consumption cap (`1` = legacy serial). |
+| `FLEET_PARALLEL_WRITES` | off | Run writing goals in isolated git worktrees and merge back. |
+| `SWARM_TELEGRAM_TOKEN` | unset | Telegram bot token; set with chat-ids to enable the mirror. |
+| `SWARM_TELEGRAM_CHAT_IDS` | unset | Comma-separated chat-id allowlist (required for Telegram). |
+| `SWARM_RECALL` | `1` | Conversation recall (LanceDB hybrid); `0` disables. |
+| `SWARM_SKILL_SYNTH` | `1` | Synthesize a skill on goal completion; `0` disables. |
+| `SWARM_CURATOR` | `1` | Weekly skill curator; `0` disables. |
 
 ## Why
 
@@ -164,6 +205,13 @@ Reproduce the operating point: `python scripts/throughput_probe.py --gate 32`.
 - **C96+** — needs an N-proportional warm-up to measure as steady state (gate MAX is 96).
 - **Tree reduction** — log-depth fan-in reducers (the board supports it; not yet a helper).
 - **Ungated summary path** — iteration-limit summary generations bypass the gate (rare; review #9, deferred).
+
+### v2 status (landed, offline + live tested)
+The self-managing parallel swarm — git-worktree writes, inter-goal dependency
+DAG, manager audit/escalation, and the Telegram mirror — is implemented and
+tested: the offline suite is green plus live runs against Step-3.7 on `:8001`.
+Checklist and per-feature test notes:
+[`swarm_agent/SWARM_V2_TODO.md`](swarm_agent/SWARM_V2_TODO.md).
 
 ## License
 
