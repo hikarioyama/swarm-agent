@@ -92,6 +92,57 @@ def gate_starved(stats: dict) -> bool:
     return int(stats.get("waiting") or 0) > 0 and int(stats.get("in_flight") or 0) == 0
 
 
+def v3_reflex_triage(snapshot: list[dict], *, now: float, stuck_seconds: float,
+                     max_attempts: int = 3) -> dict:
+    """Cheap Swarm v3 reflex pass over task records.
+
+    This is deliberately pure: it only inspects the injected snapshot/clock and returns
+    whether the expensive manager cortex pass is worth running. Deterministic remediations
+    are returned as ``(task_id, action)`` pairs for the manager to apply with its existing
+    task-store methods.
+    """
+    records = list(snapshot or [])
+    if not records:
+        return {"needs_cortex": False, "auto": [], "signals": {}}
+
+    by_id = {rec.get("id"): rec for rec in records}
+    auto: list[tuple[str, str]] = []
+    signals: dict[str, str] = {}
+    needs_cortex = False
+
+    for rec in records:
+        tid = rec.get("id")
+        if tid is None:
+            continue
+        tid = str(tid)
+        rec_signals: list[str] = []
+
+        if is_stuck(rec, now, stuck_seconds):
+            rec_signals.append(SIG_HANG)
+            needs_cortex = True
+        if is_thrashing(rec):
+            rec_signals.append(SIG_THRASH)
+            needs_cortex = True
+        if produced_nothing(rec):
+            rec_signals.append(SIG_EMPTY)
+            needs_cortex = True
+
+        dep = deadlocked_dep(rec, by_id)
+        if dep is not None:
+            rec_signals.append(SIG_DEADLOCK)
+            action = decide(
+                SIG_DEADLOCK,
+                attempts=int(rec.get("attempts") or 0),
+                max_attempts=max_attempts,
+            )
+            auto.append((tid, action))
+
+        if rec_signals:
+            signals[tid] = rec_signals[0]
+
+    return {"needs_cortex": needs_cortex, "auto": auto, "signals": signals}
+
+
 # ── remediation policy (pure decision; the manager executes the action) ──────
 
 def decide(signal: str, *, attempts: int = 0, max_attempts: int = 3) -> str:

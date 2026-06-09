@@ -6,7 +6,7 @@ import os
 import threading
 import time
 
-from fleet import config
+from fleet import config, v3
 
 from . import audit
 from . import worktree as _worktree
@@ -176,6 +176,52 @@ class CompletionManager:
                 self.runner.emit(
                     "error", text=f"task {rec['id']} deadlocked: dependency {dep} failed")
 
+    def _apply_v3_reflex_auto(self, triage: dict, snapshot) -> None:
+        """Apply deterministic reflex actions using the manager's existing side effects."""
+        by_id = {r.get("id"): r for r in snapshot}
+        for tid, action in triage.get("auto") or []:
+            rec = by_id.get(tid)
+            if not rec or action != audit.ACT_FAIL:
+                continue
+            dep = audit.deadlocked_dep(rec, by_id)
+            if dep is None:
+                continue
+            self.runner.tasks.mark_failed(
+                tid, f"dependency {dep} failed; goal can never run")
+            self.runner.emit(
+                "error", text=f"task {tid} deadlocked: dependency {dep} failed")
+
+    def _maybe_evaluate(self, now: float) -> None:
+        """Run the expensive manager cortex pass unless v3 reflex says it is unnecessary."""
+        if not self.runner.tasks.has_unfinished() or now - self._last_eval < self.interval_s:
+            return
+
+        try:
+            reflex_on = v3.enabled("reflex")
+        except Exception:
+            reflex_on = False
+
+        if not reflex_on:
+            self._last_eval = now
+            self._evaluate(now)
+            return
+
+        try:
+            snapshot = self.runner.tasks.snapshot()
+            triage = audit.v3_reflex_triage(
+                snapshot,
+                now=now,
+                stuck_seconds=float(getattr(config, "STUCK_SECONDS", 600.0)),
+                max_attempts=self.runner.tasks.max_attempts,
+            )
+            self._apply_v3_reflex_auto(triage, snapshot)
+            if triage.get("needs_cortex"):
+                self._last_eval = now
+                self._evaluate(now)
+        except Exception:
+            self._last_eval = now
+            self._evaluate(now)
+
     def _tick(self) -> None:
         # §B.4: land any completed writing-goal worktrees first (sequential merge-back).
         self._drain_merges()
@@ -223,9 +269,7 @@ class CompletionManager:
         self._gc_worktrees()
 
         now = time.time()
-        if self.runner.tasks.has_unfinished() and now - self._last_eval >= self.interval_s:
-            self._last_eval = now
-            self._evaluate(now)
+        self._maybe_evaluate(now)
 
         # Periodic skill curator: only when IDLE (no queued work, no live turn) so it never
         # competes with the swarm, and only if the server is up (the consolidation pass runs

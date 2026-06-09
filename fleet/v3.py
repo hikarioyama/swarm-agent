@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
-_RESERVED = {"reflex", "hebbian", "sleep"}
+_RESERVED = {"hebbian", "sleep"}
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -57,7 +57,7 @@ def max_rounds() -> int:
 def _flag_snapshot() -> Dict[str, bool]:
     master = _truthy(os.environ.get("SWARM_V3"))
     flags: Dict[str, bool] = {}
-    for name in ("chemical", "diversity"):
+    for name in ("chemical", "diversity", "reflex"):
         flags[name] = master and _truthy(os.environ.get(f"SWARM_V3_{name.upper()}"))
     for name in _RESERVED:
         flags[name] = False
@@ -75,7 +75,7 @@ def enabled(name: str) -> bool:
 
 def any_on() -> bool:
     flags = _flag_snapshot()
-    return any(flags.get(name, False) for name in ("chemical", "diversity"))
+    return any(flags.get(name, False) for name in ("chemical", "diversity", "reflex"))
 
 
 _FENCE_RE = re.compile(r"```(?:json|chem|chemical)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
