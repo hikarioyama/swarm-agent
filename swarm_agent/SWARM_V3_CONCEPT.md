@@ -31,17 +31,18 @@ workers post and what verifiers refute.
 |---|-----------|----------|---------|
 | 1 | **Chemical board** — every result carries `chem` metadata (hypothesis/stance/evidence/confidence/contradictions); ready tasks are claimed in `priority_score` order | **commit-1** | `fleet/board.py`, `fleet/v3.py` |
 | 2 | **Diversity quorum** — a reducer does not accept a single-stance majority; if stance diversity is too low it spawns a `contrarian`/`referee` and waits | **commit-1** | `fleet/board.py`, `fleet/engine.py` |
-| 3 | **Reflex↔cortex escalation** — cheap reflex handles low-uncertainty/high-strength work; stale / contradictory / low-diversity-high-confidence escalates to a deep `referee` | commit-2 | `swarm_agent/audit.py`, `manager.py` |
-| 4 | **Hebbian credit** — a verified-correct (profile × domain) route is reinforced via `usage.bump_use`-style telemetry and biases later worker selection | commit-3 | `swarm_agent/taskstore.py`, `fleet/board.py` |
-| 5 | **Sleep consolidation** — idle curator compacts trap fingerprints into avoid-rules and prunes expired signals | commit-3 | `manager.py`, `skills/curator.py` |
+| 3 | **Reflex↔cortex escalation** — cheap reflex handles low-uncertainty/high-strength work; stale / contradictory / low-diversity-high-confidence escalates to a deep `referee` | **commit-2** | `swarm_agent/audit.py`, `manager.py` |
+| 4 | **Hebbian credit** — a verified-correct (profile × domain) route is reinforced in a JSON sidecar and biases later referee-profile routing | **commit-3** | `fleet/v3_credit.py`, `fleet/board.py` |
+| 5 | **Sleep consolidation** — repeated trap fingerprints compact into avoid-rules that down-weight known decoy stances during quorum/reduce | **commit-3** | `fleet/v3_sleep.py`, `fleet/v3.py`, `fleet/board.py` |
 
 **Cut (not in v3):** full token-economy / GPU-tax, contract-net bidding, Context-DNA
 breeding, weather-field board, jury-of-the-dead, predictive shadow-board. Reasons: base
 rewrite, unproven convergence, or prefix-cache conflict. Revisit only after commit-1 earns
 its keep on the live benchmark.
 
-This doc fully specifies **commit-1 (mechanisms 1 + 2)**. The herding trap is defeated by
-1+2 alone, which is the measurable thesis ("v3 > v2") the offline test proves today.
+This doc specifies commit-1 through commit-3. The herding trap is defeated by 1+2, reflex
+cuts unnecessary cortex passes in commit-2, and commit-3 adds learned referee routing plus
+sleep-consolidated trap memory without changing the all-off path.
 
 ## 2. `fleet/v3.py` — the pure core (new file)
 
@@ -54,7 +55,9 @@ it is trivially unit-testable and import-safe. **All defaults OFF.**
 SWARM_V3=0|1                 master switch (off ⇒ every sub-flag forced off)
 SWARM_V3_CHEMICAL=0|1        mechanism 1 (priority claim + signal recording)
 SWARM_V3_DIVERSITY=0|1       mechanism 2 (diversity quorum / referee spawn)
-SWARM_V3_REFLEX / _HEBBIAN / _SLEEP   reserved for commit-2/3 (resolve to False now)
+SWARM_V3_REFLEX=0|1          mechanism 3 (reflex triage before cortex)
+SWARM_V3_HEBBIAN=0|1         mechanism 4 (learned referee-profile routing)
+SWARM_V3_SLEEP=0|1           mechanism 5 (trap-fingerprint suppression)
 ```
 
 Resolver contract: `v3.enabled("chemical") -> bool`. Returns False unless **both** the
@@ -167,6 +170,63 @@ Idempotency + the `max_rounds` bound are mandatory (kill-criterion #2: quorum mu
 loop). When diversity is already adequate, this is a no-op and the reducer proceeds exactly
 as v2.
 
+### 3.5 Hebbian referee routing (mechanism 4) — **shipped in commit-3**
+
+`fleet/v3_credit.py` is a fail-soft JSON sidecar at
+`SWARM_V3_CREDIT_PATH` (default `~/.cache/swarm-agent/v3_credit.json`) with atomic writes
+and an optional `fcntl` lock:
+
+```python
+bump_credit(profile, domain, *, amount=1.0) -> None
+credit_score(profile, domain) -> float
+order_profiles(candidates, domain) -> list[str]   # stable: high credit first
+reset() -> None                                   # test helper
+```
+
+Every API is a no-op/zero/identity unless `v3.enabled("hebbian")` is true. The real
+consumption seam is `Board.spawn_referee()` / `SqliteBoard.spawn_referee()`: with Hebbian
+off, the referee kind remains exactly the caller/default `contrarian`; with Hebbian on,
+the board orders `["contrarian", "domain_expert"]` by `(profile, domain)` credit and writes
+the winner into referee task meta as `v3_kind`.
+
+Verified outcomes can reinforce the winning route through:
+
+```python
+board.credit_outcome(reducer_tid, winning_profile, domain)
+```
+
+That helper is also gated and fail-soft; it calls `v3_credit.bump_credit()` only when the
+reducer exists and Hebbian is enabled.
+
+### 3.6 Sleep suppression (mechanism 5) — **shipped in commit-3**
+
+`fleet/v3_sleep.py` is a fail-soft JSON sidecar at
+`SWARM_V3_SLEEP_PATH` (default `~/.cache/swarm-agent/v3_sleep.json`) with the same atomic
+write / optional lock style:
+
+```python
+record_trap(domain, decoy_stance) -> None
+consolidate() -> int                              # observations >= threshold become rules
+is_suppressed(domain, stance) -> bool
+reset() -> None                                   # test helper
+```
+
+The default consolidation threshold is `SWARM_V3_SLEEP_THRESHOLD=2`. Every API is a
+no-op/empty/false unless `v3.enabled("sleep")` is true.
+
+The real consumption seam is in quorum/reduce weighting. `fleet/v3.py` exposes pure helpers:
+
+```python
+suppressed_filter(signals, domain, *, is_suppressed=...) -> list[chem]
+weighted_stance_counts(signals, domain, *, is_suppressed=...) -> dict[str, float]
+```
+
+With sleep off, these are identity/counting helpers. With sleep on, callers pass
+`v3_sleep.is_suppressed`; matching stances are retained for traceability but receive
+`weight=0.0` and `confidence=0.0`, so a known decoy cannot win purely by majority. Board
+quorum calls also pass the suppression callback when sleep is enabled, which prevents a
+suppressed high-confidence stance from clearing quorum acceptance unchanged.
+
 ## 4. `fleet/engine.py` integration (commit-1)
 
 Single gated hook in the completion path of `ThreadFleet.run()` (mirror in
@@ -216,7 +276,8 @@ PASS thresholds (commit-1 scope = mechanisms 1+2):
 - diversity quorum fired on `>= 20/24` herding scenarios
 - overhead: v3 total fake-worker calls `<= 1.8 ×` v2 (referee spawns are bounded)
 
-(Hebbian-epoch and sleep-fingerprint metrics are deferred to commit-3's test.)
+Hebbian and sleep have separate commit-3 epoch tests that prove the real consumption seams
+improve measurable outcomes.
 
 ### 5.2 `tests/test_swarm_v3_fallback.py` — **all-off == v2** (the safety lock)
 
@@ -236,6 +297,22 @@ This file is authored independently (Codex) as a cross-check on the chemistry au
 3 scenarios against the real Step-3.7 server `:8001`: clean / herding-ish / ambiguous.
 PASS = server reachable, all reach final-or-error, ≥1 v3 event recorded, `unfinished==0`, no
 deadlock. Quality not strictly scored. Heavy 40-scenario live A/B is future work.
+
+### 5.4 `tests/test_swarm_v3_hebbian.py` — learned routing improves epoch-2 cost
+
+The epoch test first trains credit through `board.credit_outcome()` for the profiles that
+actually resolve each domain trap, then replays epoch-2 traps through the real
+`Board.spawn_referee()` seam. With Hebbian on, the effective profile routes first for each
+domain and requires fewer simulated worker/referee attempts than a Hebbian-disabled control
+that still spawns the default `contrarian`.
+
+### 5.5 `tests/test_swarm_v3_sleep.py` — consolidated traps reduce decoy adoption
+
+The epoch test records repeated decoy fingerprints, runs `v3_sleep.consolidate()`, then
+replays the same majority-decoy reducer inputs. The reduce step uses
+`v3.weighted_stance_counts(..., is_suppressed=v3_sleep.is_suppressed)`, so the known decoy
+majority is down-weighted and the truth stance wins where the sleep-disabled control adopts
+the decoy.
 
 ## 6. Kill criteria (stop — the design is wrong)
 

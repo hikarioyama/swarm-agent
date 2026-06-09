@@ -152,12 +152,22 @@ class Board:
                 if isinstance(chem, dict):
                     signals.append(chem)
             rounds_done = int((reducer.meta or {}).get("v3_rounds", 0) or 0)
+            domain = str((reducer.meta or {}).get("domain") or "default")
+            is_suppressed = None
+            if v3.enabled("sleep"):
+                try:
+                    from . import v3_sleep
+                    is_suppressed = v3_sleep.is_suppressed
+                except Exception:
+                    is_suppressed = None
             decision = v3.quorum_decision(
                 signals,
                 min_diversity=v3.min_diversity(),
                 accept_conf=v3.accept_conf(),
                 max_rounds=v3.max_rounds(),
                 rounds_done=rounds_done,
+                domain=domain,
+                is_suppressed=is_suppressed,
             )
             if decision != "need_diversity":
                 return None
@@ -165,12 +175,21 @@ class Board:
             ref_id = f"{reducer_tid}:v3_referee:{next_round}"
             if ref_id in self._tasks or next_round > v3.max_rounds():
                 return None
+            chosen_kind = kind
+            if v3.enabled("hebbian"):
+                try:
+                    from . import v3_credit
+                    chosen_kind = v3_credit.order_profiles(
+                        ["contrarian", "domain_expert"], domain
+                    )[0]
+                except Exception:
+                    chosen_kind = kind
             ref = Task(
                 id=ref_id,
                 prompt=f"Referee for {reducer_tid}",
                 deps=list(reducer.deps),
                 lane="referee",
-                meta={"v3_kind": kind, "v3_reducer": reducer_tid, "v3_round": next_round},
+                meta={"v3_kind": chosen_kind, "v3_reducer": reducer_tid, "v3_round": next_round},
             )
             self._tasks[ref.id] = ref
             self._refresh(ref)
@@ -181,6 +200,18 @@ class Board:
                 reducer.state = State.PENDING
             self._refresh(reducer)
             return ref.id
+
+    def credit_outcome(self, reducer_tid: str, winning_profile: str, domain: str) -> None:
+        if not v3.enabled("hebbian"):
+            return
+        with self._lock:
+            if reducer_tid not in self._tasks:
+                return
+        try:
+            from . import v3_credit
+            v3_credit.bump_credit(winning_profile, domain)
+        except Exception:
+            pass
 
     def fail(self, tid: str, error: str, max_retries: int) -> bool:
         """Mark failed; requeue if retries remain. Returns True if requeued."""
@@ -789,12 +820,22 @@ class SqliteBoard:
                 return None
             signals = self.stance_signals(reducer.deps)
             rounds_done = int((reducer.meta or {}).get("v3_rounds", 0) or 0)
+            domain = str((reducer.meta or {}).get("domain") or "default")
+            is_suppressed = None
+            if v3.enabled("sleep"):
+                try:
+                    from . import v3_sleep
+                    is_suppressed = v3_sleep.is_suppressed
+                except Exception:
+                    is_suppressed = None
             decision = v3.quorum_decision(
                 signals,
                 min_diversity=v3.min_diversity(),
                 accept_conf=v3.accept_conf(),
                 max_rounds=v3.max_rounds(),
                 rounds_done=rounds_done,
+                domain=domain,
+                is_suppressed=is_suppressed,
             )
             if decision != "need_diversity":
                 return None
@@ -806,7 +847,16 @@ class SqliteBoard:
             if exists is not None:
                 return None
             ref_deps = list(reducer.deps)
-            ref_meta = {"v3_kind": kind, "v3_reducer": reducer_tid, "v3_round": next_round}
+            chosen_kind = kind
+            if v3.enabled("hebbian"):
+                try:
+                    from . import v3_credit
+                    chosen_kind = v3_credit.order_profiles(
+                        ["contrarian", "domain_expert"], domain
+                    )[0]
+                except Exception:
+                    chosen_kind = kind
+            ref_meta = {"v3_kind": chosen_kind, "v3_reducer": reducer_tid, "v3_round": next_round}
             conn.execute(
                 """INSERT INTO tasks (id, prompt, deps, lane, state, result, error,
                                       retries, meta, seq)
@@ -826,6 +876,19 @@ class SqliteBoard:
             return ref_id
 
         return self._run_locked(_body)
+
+    def credit_outcome(self, reducer_tid: str, winning_profile: str, domain: str) -> None:
+        if not v3.enabled("hebbian"):
+            return
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT 1 FROM tasks WHERE id=?", (reducer_tid,)).fetchone()
+            if row is None:
+                return
+            from . import v3_credit
+            v3_credit.bump_credit(winning_profile, domain)
+        except Exception:
+            pass
 
     def complete(self, tid: str, result: str) -> bool:
         """Mark a RUNNING task DONE. Returns True if the write landed, False if it was

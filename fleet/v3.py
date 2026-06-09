@@ -1,4 +1,4 @@
-"""Pure Swarm v3 commit-1 mechanics.
+"""Pure Swarm v3 mechanics.
 
 This module is intentionally import-safe: stdlib only, no fleet/swarm imports, and all
 features default off behind cached environment flags.
@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
-_RESERVED = {"hebbian", "sleep"}
+_SUBFLAGS = ("chemical", "diversity", "reflex", "hebbian", "sleep")
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -57,10 +57,8 @@ def max_rounds() -> int:
 def _flag_snapshot() -> Dict[str, bool]:
     master = _truthy(os.environ.get("SWARM_V3"))
     flags: Dict[str, bool] = {}
-    for name in ("chemical", "diversity", "reflex"):
+    for name in _SUBFLAGS:
         flags[name] = master and _truthy(os.environ.get(f"SWARM_V3_{name.upper()}"))
-    for name in _RESERVED:
-        flags[name] = False
     return flags
 
 
@@ -75,7 +73,7 @@ def enabled(name: str) -> bool:
 
 def any_on() -> bool:
     flags = _flag_snapshot()
-    return any(flags.get(name, False) for name in ("chemical", "diversity", "reflex"))
+    return any(flags.get(name, False) for name in _SUBFLAGS)
 
 
 _FENCE_RE = re.compile(r"```(?:json|chem|chemical)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
@@ -187,10 +185,51 @@ def priority_score(task_meta: Optional[Dict[str, Any]], *, now: Optional[float] 
     return decayed_strength * (1.0 + uncertainty) * (1.0 + novelty) / (1.0 + max(0.0, crowding))
 
 
+def suppressed_filter(signals: Iterable[Dict[str, Any]], domain: str = "default", *,
+                      is_suppressed=None) -> List[Dict[str, Any]]:
+    """Return signals with known sleep-decoy stances down-weighted.
+
+    The helper is pure: callers provide the suppression predicate. With sleep off,
+    or without a predicate, the original valid signal objects are returned unchanged.
+    """
+    sigs = [s for s in (signals or []) if isinstance(s, dict)]
+    if not enabled("sleep") or is_suppressed is None:
+        return sigs
+    out: List[Dict[str, Any]] = []
+    for sig in sigs:
+        try:
+            suppressed = bool(is_suppressed(str(domain or "default"), _stance(sig)))
+        except Exception:
+            suppressed = False
+        if not suppressed:
+            out.append(sig)
+            continue
+        copied = dict(sig)
+        copied["confidence"] = 0.0
+        copied["weight"] = 0.0
+        copied["suppressed"] = True
+        out.append(copied)
+    return out
+
+
+def weighted_stance_counts(signals: Iterable[Dict[str, Any]], domain: str = "default", *,
+                           is_suppressed=None) -> Dict[str, float]:
+    counts: Dict[str, float] = {}
+    for sig in suppressed_filter(signals, domain, is_suppressed=is_suppressed):
+        try:
+            weight = float(sig.get("weight", 1.0))
+        except (TypeError, ValueError):
+            weight = 1.0
+        if not math.isfinite(weight):
+            weight = 1.0
+        counts[_stance(sig)] = counts.get(_stance(sig), 0.0) + max(0.0, weight)
+    return counts
+
+
 def quorum_decision(signals: Iterable[Dict[str, Any]], *, min_diversity: Optional[float] = None,
                     accept_conf: Optional[float] = None, max_rounds: Optional[int] = None,
-                    rounds_done: int = 0) -> str:
-    sigs = [s for s in (signals or []) if isinstance(s, dict)]
+                    rounds_done: int = 0, domain: str = "default", is_suppressed=None) -> str:
+    sigs = suppressed_filter(signals, domain, is_suppressed=is_suppressed)
     if not sigs:
         return "insufficient"
     min_div = min_diversity if min_diversity is not None else globals()["min_diversity"]()
