@@ -488,6 +488,39 @@ def new_session_id(task_id: str = "") -> str:
 _SANDBOX_ISOLATE = os.environ.get("FLEET_SANDBOX_ISOLATE", "1") not in ("0", "false", "False")
 _SANDBOX_ROOT = os.environ.get("FLEET_SANDBOX_ROOT") or None  # None => system tempdir
 
+# ── per-GOAL worktree roots (SWARM_V2 §A.1) ─────────────────────────────────────
+# When FLEET_PARALLEL_WRITES routes a writing goal into its own git worktree, every worker of
+# that goal must root its cwd at the WORKTREE (a real checkout), shared within the goal and
+# isolated ACROSS goals. The runner registers goal_id -> worktree path here; worker_sandbox
+# looks it up by the goal_id PREFIX of the (namespaced) task id. This is independent of
+# FLEET_SANDBOX_ISOLATE (worktree isolation must hold even when the per-worker tempdir sandbox
+# is off — which is exactly the repo-touching configuration). A dict keyed by goal_id is
+# concurrency-safe for parallel writers (no shared module-global cwd to race, unlike
+# sandbox_root). NOTE: worker teardown frees the worker's bash/env but NEVER deletes the
+# worktree dir — worktree.py owns its lifecycle (merge-back then remove/park).
+_GOAL_WORKTREES: "dict[str, str]" = {}
+_GOAL_WT_LOCK = threading.RLock()
+
+
+def register_goal_worktree(goal_id: str, path: str) -> None:
+    with _GOAL_WT_LOCK:
+        _GOAL_WORKTREES[str(goal_id)] = str(path)
+
+
+def unregister_goal_worktree(goal_id: str) -> None:
+    with _GOAL_WT_LOCK:
+        _GOAL_WORKTREES.pop(str(goal_id), None)
+
+
+def goal_worktree_for(task_id: str) -> Optional[str]:
+    """The worktree root for the goal owning ``task_id`` (namespaced ``<goal_id>.<task>``), or
+    None. Interactive turns use un-namespaced ids that match no registered goal → None."""
+    if not task_id:
+        return None
+    goal_id = str(task_id).split(".", 1)[0]
+    with _GOAL_WT_LOCK:
+        return _GOAL_WORKTREES.get(goal_id)
+
 
 @contextlib.contextmanager
 def sandbox_root(path):
@@ -564,7 +597,57 @@ def worker_sandbox(task_id: str):
     Safe-by-default: if isolation is disabled (FLEET_SANDBOX_ISOLATE=0) or the hermes
     sandbox API is unavailable, this is a NON-FATAL no-op (the lead's no-tool sweep is
     unaffected; tool-using workers fall back to the shared "default" sandbox as before).
+
+    WORKTREE MODE (SWARM_V2 §A.1): if this task belongs to a goal with a registered worktree,
+    root the worker at that worktree (a real checkout, shared within the goal). This takes
+    precedence over and is INDEPENDENT of FLEET_SANDBOX_ISOLATE — worktree isolation must hold
+    even with the per-worker tempdir sandbox off. The worktree dir is NEVER deleted here
+    (worktree.py owns it); only the worker's bash/env override is torn down.
     """
+    wt_root = goal_worktree_for(task_id)
+    if wt_root:
+        register, clear = _hermes_sandbox_api()
+        if register is None or not os.path.isdir(wt_root):
+            yield None
+            return
+        try:
+            register(task_id, {"cwd": wt_root})
+        except Exception:
+            yield None
+            return
+        # Eagerly materialise the file-ops/terminal env rooted at the worktree. Without this,
+        # hermes' bare write_file resolves a RELATIVE path against os.getcwd() (the shared base
+        # repo) until a terminal command first creates the env — so a coder that only calls
+        # write_file would write OUTSIDE its worktree and parallel writers could collide. Priming
+        # the env (cwd = the registered override) makes BOTH the file and terminal tools resolve
+        # into the worktree from the first call. Best-effort: a fallback still works if absent.
+        try:
+            from tools import file_tools as _file_tools  # type: ignore
+            _file_tools._get_file_ops(task_id)
+        except Exception:
+            pass
+        try:
+            yield wt_root
+        finally:
+            try:
+                _ensure_hermes_on_path()
+                from tools.terminal_tool import cleanup_vm  # type: ignore
+                cleanup_vm(task_id, force_remove=True)
+            except Exception:
+                pass
+            try:
+                from tools import file_tools as _file_tools  # type: ignore
+                _file_tools.clear_file_ops_cache(task_id)
+            except Exception:
+                pass
+            try:
+                clear(task_id)
+            except Exception:
+                pass
+            # NB: do NOT rmtree(wt_root) — the goal worktree is shared by every worker of the
+            # goal and reclaimed by worktree.merge_back/remove after the goal completes.
+        return
+
     if not _SANDBOX_ISOLATE or not task_id:
         yield None
         return

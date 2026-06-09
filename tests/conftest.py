@@ -31,3 +31,18 @@ def _isolate_swarm_state():
 def path(tmp_path):
     """SQLite board tests expect a string DB path, matching their script-mode calls."""
     return str(tmp_path / "board.db")
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "live: end-to-end test that needs a running Step-3.7 endpoint")
+
+
+@pytest.fixture
+def live_endpoint():
+    """Skip a live test unless the Step-3.7 endpoint answers /metrics."""
+    from fleet import config as fcfg
+    from fleet import metrics
+    if metrics.scrape(fcfg.METRICS_URL, timeout=1.0) is None:
+        pytest.skip(f"Step-3.7 endpoint unreachable at {fcfg.METRICS_URL}")
+    return fcfg.METRICS_URL

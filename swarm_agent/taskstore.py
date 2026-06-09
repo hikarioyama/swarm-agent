@@ -9,6 +9,12 @@ import uuid
 from pathlib import Path
 
 
+def _now() -> float:
+    """Single clock seam for the store. Tests monkeypatch this to inject a fake clock
+    so stuck/liveness assertions never sleep on the wall clock (SWARM_V2_TODO §0)."""
+    return time.time()
+
+
 class TaskStore:
     """JSON-backed, thread-safe queue of goals that survive TUI restarts."""
 
@@ -30,6 +36,9 @@ class TaskStore:
             self._records = []
         recovered = False
         for rec in self._records:
+            # Migrate legacy records that predate the inter-goal DAG (§2.1): no deps key → [].
+            if "deps" not in rec:
+                rec["deps"] = []
             if rec.get("state") == "running":
                 rec["state"] = "pending"
                 rec["started_at"] = None
@@ -49,9 +58,11 @@ class TaskStore:
                 return rec
         return None
 
-    def add(self, goal: str) -> dict:
+    def add(self, goal: str, *, deps=None, now: float | None = None) -> dict:
+        """Append a pending goal. ``deps`` are the ids of OTHER queued goals whose result this
+        one needs (inter-goal DAG edges, §A.2) — it stays unclaimable until they are ``done``."""
         with self._lock:
-            now = time.time()
+            now = _now() if now is None else now
             rec = {
                 "id": f"task-{uuid.uuid4().hex[:8]}",
                 "goal": goal,
@@ -63,6 +74,7 @@ class TaskStore:
                 "result": None,
                 "error": None,
                 "progress_at": now,
+                "deps": [str(d) for d in (deps or [])],
             }
             self._records.append(rec)
             self._persist()
@@ -76,21 +88,27 @@ class TaskStore:
         return None
 
     def claim_next(self) -> dict | None:
-        """Atomically claim the oldest pending goal: pending -> running, returns a copy.
+        """Atomically claim the oldest DISPATCHABLE pending goal: pending -> running, copy.
 
         Single locked transition (vs next_pending() + mark_running()) so two concurrent
-        dispatchers can never claim the same goal (PARALLEL_GOALS_PLAN §4.3). Returns None
-        when nothing is pending.
+        dispatchers can never claim the same goal (PARALLEL_GOALS_PLAN §4.3). Dependency-aware
+        (§2.2): a goal is dispatchable only once EVERY one of its ``deps`` is ``done`` — a goal
+        waiting on an unfinished (or failed) dep is skipped, so the oldest *ready* goal wins.
+        Returns None when nothing is ready.
         """
         with self._lock:
+            done = {r.get("id") for r in self._records if r.get("state") == "done"}
             for rec in self._records:
-                if rec.get("state") == "pending":
-                    now = time.time()
-                    rec["state"] = "running"
-                    rec["started_at"] = now
-                    rec["progress_at"] = now
-                    self._persist()
-                    return dict(rec)
+                if rec.get("state") != "pending":
+                    continue
+                if not all(dep in done for dep in (rec.get("deps") or [])):
+                    continue                       # a dep is not done yet → not dispatchable
+                now = _now()
+                rec["state"] = "running"
+                rec["started_at"] = now
+                rec["progress_at"] = now
+                self._persist()
+                return dict(rec)
         return None
 
     def mark_running(self, tid: str) -> None:
@@ -98,26 +116,46 @@ class TaskStore:
             rec = self._find(tid)
             if rec is None:
                 return
-            now = time.time()
+            now = _now()
             rec["state"] = "running"
             rec["started_at"] = now
             rec["progress_at"] = now
             self._persist()
 
-    def touch(self, tid: str) -> None:
+    def touch(self, tid: str, *, now: float | None = None) -> None:
+        """Advance a record's last-progress timestamp. Called on every fleet task event
+        for a queued goal so a healthy long-running goal keeps a fresh ``progress_at`` —
+        without this the manager cannot tell "running+progressing" from "running+stuck"
+        (the whole point of §B.1: today ``progress_at`` only moves at start)."""
         with self._lock:
             rec = self._find(tid)
             if rec is None:
                 return
-            rec["progress_at"] = time.time()
+            rec["progress_at"] = _now() if now is None else now
             self._persist()
+
+    def seconds_since_progress(self, tid: str, now: float | None = None) -> float | None:
+        """Pure read: seconds elapsed since the record last made progress, or None if the
+        record is unknown. One definition of "stale" the manager's stuck-detection relies on
+        (SWARM_V2_TODO §0.2). Falls back to ``created_at`` for a record never touched."""
+        now = _now() if now is None else now
+        with self._lock:
+            rec = self._find(tid)
+            if rec is None:
+                return None
+            base = rec.get("progress_at")
+            if base is None:
+                base = rec.get("created_at")
+            if base is None:
+                return None
+            return max(0.0, now - float(base))
 
     def complete(self, tid: str, result: str) -> None:
         with self._lock:
             rec = self._find(tid)
             if rec is None:
                 return
-            now = time.time()
+            now = _now()
             rec["state"] = "done"
             rec["finished_at"] = now
             rec["result"] = result
@@ -130,7 +168,7 @@ class TaskStore:
             rec = self._find(tid)
             if rec is None:
                 return ""
-            now = time.time()
+            now = _now()
             rec["attempts"] = int(rec.get("attempts") or 0) + 1
             rec["state"] = "pending" if rec["attempts"] < self.max_attempts else "failed"
             rec["started_at"] = None
@@ -140,6 +178,24 @@ class TaskStore:
             self._persist()
             return rec["state"]
 
+    def mark_failed(self, tid: str, error: str) -> None:
+        """Terminally fail a goal WITHOUT incrementing attempts or re-queuing (unlike ``fail``).
+
+        Used by the manager for an unrecoverable situation — a DAG deadlock (a dep failed) or
+        an escalated, budget-exhausted goal — where retrying is pointless and re-pending would
+        loop the auditor. ``fail`` is for a genuine attempt that erred (and may retry)."""
+        with self._lock:
+            rec = self._find(tid)
+            if rec is None:
+                return
+            now = _now()
+            rec["state"] = "failed"
+            rec["started_at"] = None
+            rec["finished_at"] = now
+            rec["error"] = error
+            rec["progress_at"] = now
+            self._persist()
+
     def requeue(self, tid: str) -> None:
         with self._lock:
             rec = self._find(tid)
@@ -148,7 +204,7 @@ class TaskStore:
             rec["state"] = "pending"
             rec["started_at"] = None
             rec["finished_at"] = None
-            rec["progress_at"] = time.time()
+            rec["progress_at"] = _now()
             self._persist()
 
     def counts(self) -> dict:

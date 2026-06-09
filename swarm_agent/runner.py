@@ -41,6 +41,7 @@ from fleet.engine import ThreadFleet
 from fleet.worker import _final_text
 from . import goal as goal_mod
 from . import recall as _recall
+from . import worktree as _worktree
 from .skills import synth as _skills_synth
 from .taskstore import TaskStore
 
@@ -175,11 +176,25 @@ class SwarmRunner:
         self._warm = warm
         self.tasks = TaskStore()
         self._wake = threading.Event()
+        # Completed writing-goal worktrees awaiting sequential merge-back by the manager
+        # (SWARM_V2 §B.4). Merges are linearised (one at a time) even though goals ran in
+        # parallel, so the base branch never sees an interleaved half-merge.
+        self._merges: "list" = []
+        self._merge_lock = threading.Lock()
         # The completion manager is CREATED here but only STARTED by start_manager()
         # (the TUI calls it). Merely constructing a SwarmRunner — e.g. in a test — must
         # NOT spin up a thread that could dispatch persisted goals against a live server.
         from .manager import CompletionManager
         self._manager = CompletionManager(self)
+        # In-process Telegram mirror (SWARM_V2 §C). Constructed always but a COMPLETE no-op
+        # unless a bot token + chat-id allowlist are configured (SWARM_TELEGRAM_TOKEN /
+        # SWARM_TELEGRAM_CHAT_IDS). Started by start_manager(), stopped by shutdown() — so it
+        # lives and dies with this runner / TUI session.
+        try:
+            from .telegram import TelegramBridge
+            self._telegram = TelegramBridge(self, log_path=getattr(self.log, "path", None))
+        except Exception:
+            self._telegram = None
 
     # ── events ────────────────────────────────────────────────────────────────
     def _publish(self, ev: dict) -> None:
@@ -255,8 +270,19 @@ class SwarmRunner:
         if self._manager is not None:
             self._manager.start()
             self._wake.set()
+        # Bring up the Telegram mirror alongside the session (no-op if unconfigured).
+        if getattr(self, "_telegram", None) is not None:
+            try:
+                self._telegram.start()
+            except Exception:
+                pass
 
     def shutdown(self) -> None:
+        if getattr(self, "_telegram", None) is not None:
+            try:
+                self._telegram.stop()
+            except Exception:
+                pass
         if self._manager is not None:
             try:
                 self._manager.stop()
@@ -275,10 +301,24 @@ class SwarmRunner:
             pass
 
     # ── public API ──────────────────────────────────────────────────────────────
-    def enqueue_task(self, goal: str) -> dict:
-        """Add a goal to the persistent queue and wake the completion manager."""
-        rec = self.tasks.add(goal)
-        self.emit("queued", goal=goal, queue=self.tasks.counts())
+    def enqueue_task(self, goal: str, *, analyze: bool = True) -> dict:
+        """Add a goal to the persistent queue and wake the completion manager.
+
+        §A.2: a cheap dependency analysis at enqueue marks the new goal as waiting on any
+        already-queued goal whose RESULT it needs (so the dep-aware ``claim_next`` keeps it
+        back until that goal is done). Fail-soft — it only runs when there are unfinished
+        goals to depend on, and any error (incl. a down server) falls open to ``deps=[]``."""
+        deps: list[str] = []
+        if analyze:
+            try:
+                existing = [r for r in self.tasks.snapshot()
+                            if r.get("state") in ("pending", "running")]
+                if existing:
+                    deps = goal_mod.analyze_deps(goal, existing, run_agent=self._run_agent)
+            except Exception:
+                deps = []
+        rec = self.tasks.add(goal, deps=deps)
+        self.emit("queued", goal=goal, deps=deps, queue=self.tasks.counts())
         self._wake.set()
         return rec
 
@@ -578,6 +618,66 @@ class SwarmRunner:
                 return
             time.sleep(0.5)
 
+    # ── worktree write-isolation (SWARM_V2 §A.1) ─────────────────────────────────
+    def _isolation_for(self, readonly: bool, goal_id: Optional[str]):
+        """Decide how a goal's fleet is isolated. Returns ``(mode, worktree)`` where mode is
+        one of "readonly" / "worktree" / "exclusive" and worktree is a ``_worktree.Worktree``
+        only for the "worktree" mode. A writing QUEUED goal under ``FLEET_PARALLEL_WRITES`` in
+        a git repo gets its own worktree (and a SHARED scheduler permit); a non-git dir or a
+        worktree-create failure falls back to today's EXCLUSIVE behaviour with a loud status
+        (§1.5). Read-only goals never need a worktree."""
+        if readonly:
+            return ("readonly", None)
+        if not (config.PARALLEL_WRITES and goal_id is not None):
+            return ("exclusive", None)
+        repo = _worktree.repo_root(os.getcwd())
+        if not repo:
+            self.emit("status", goal_id=goal_id, text=(
+                "worktree unavailable (not a git repo) — running this writing goal exclusively"))
+            return ("exclusive", None)
+        try:
+            wt = _worktree.create(goal_id, repo=repo, worktree_root=config.WORKTREE_ROOT,
+                                  branch_prefix=config.GOAL_BRANCH_PREFIX)
+        except Exception as e:
+            self.emit("status", goal_id=goal_id, text=(
+                f"worktree create failed ({type(e).__name__}) — running exclusively"))
+            return ("exclusive", None)
+        compat.register_goal_worktree(goal_id, wt.path)
+        self.emit("status", goal_id=goal_id,
+                  text=f"isolated in worktree {os.path.basename(wt.path)} on {wt.branch}")
+        return ("worktree", wt)
+
+    def enqueue_merge(self, wt) -> None:
+        """Queue a completed writing goal's worktree for the manager's sequential merge-back."""
+        with self._merge_lock:
+            self._merges.append(wt)
+        self._wake.set()
+
+    def pop_pending_merge(self):
+        """Pop the next pending worktree merge (FIFO), or None. Used by the manager."""
+        with self._merge_lock:
+            return self._merges.pop(0) if self._merges else None
+
+    def _finish_worktree_goal(self, wt, goal_text: str, goal_id: Optional[str]) -> None:
+        """After a worktree-isolated fleet completes: unregister the worker cwd routing, commit
+        the produced changes, and either queue the worktree for merge-back (work produced) or
+        remove it (nothing produced). The actual merge is the manager's serial duty (§B.4)."""
+        compat.unregister_goal_worktree(goal_id)
+        try:
+            sha = _worktree.commit(wt.path, f"swarm goal {goal_id}: {goal_text[:60]}")
+        except Exception as e:
+            self.emit("status", goal_id=goal_id,
+                      text=f"worktree commit failed ({type(e).__name__}); leaving for GC")
+            return
+        if sha:
+            self.enqueue_merge(wt)
+        else:
+            # No file changes — nothing to merge; reclaim the empty worktree immediately.
+            try:
+                _worktree.remove(wt)
+            except Exception:
+                pass
+
     # ── swarm: plan → board → ThreadFleet → final deliverable ────────────────────
     def _run_swarm(self, goal_text: str, *, goal_id: Optional[str] = None) -> tuple[bool, str]:
         self.emit("planning", goal_id=goal_id)
@@ -614,25 +714,40 @@ class SwarmRunner:
         board.add_many(tasks)
 
         def push(kind, tid, counts=None, **extra):
+            # P0.1 (liveness §B.1): advance this goal's per-goal last-progress timestamp on
+            # every fleet task event, so a healthy long-running goal looks ALIVE to the
+            # manager instead of identical to a hung one (today progress_at only moves at
+            # start). Queued goals only (goal_id set); interactive turns carry no record.
+            if goal_id is not None:
+                self.tasks.touch(goal_id)
             self._publish({"kind": "task", "event": kind, "id": tid,
                            "counts": counts or {}, "goal_id": goal_id, **extra})
 
         # Acquire the shared/exclusive permit for the fleet execution ONLY (not planning),
-        # then run, then release (context manager). This is what bounds write goals to
-        # exclusive and read-only goals to ≤K concurrent (§4.1/4.2).
-        # Writing goals (exclusive) also get a PRIVATE sandbox root so their coder workers'
-        # ephemeral cwd cannot clobber an interactive turn's or another goal's (§4.3).
+        # then run, then release (context manager). Read-only goals + worktree-isolated
+        # writers take a SHARED reader slot (≤K concurrent); a non-worktree writer takes the
+        # EXCLUSIVE permit and a PRIVATE sandbox root so its coder workers' ephemeral cwd
+        # cannot clobber another goal's (§4.1–4.3, §A.1, §1.4–1.5).
         import contextlib as _contextlib
         import tempfile as _tempfile
-        if readonly:
-            sb_ctx = _contextlib.nullcontext()
-        else:
+        mode, wt = self._isolation_for(readonly, goal_id)
+        if mode == "exclusive":
             sb_ctx = compat.sandbox_root(
                 _tempfile.mkdtemp(prefix=f"swarm-goal-{(goal_id or 'turn')}-"))
-        with self._goals.permit(readonly=readonly), sb_ctx:
-            if not readonly:
-                self._await_abandoned_writers(goal_id)
-            out = ThreadFleet(board, self.gate, cfg=config, on_event=push).run()
+            permit_readonly = False
+        else:
+            # readonly → no sandbox; worktree → per-worker cwd routing (compat goal-worktree
+            # registry), so no module-global sandbox root to race across parallel writers.
+            sb_ctx = _contextlib.nullcontext()
+            permit_readonly = True
+        try:
+            with self._goals.permit(readonly=permit_readonly), sb_ctx:
+                if mode == "exclusive":
+                    self._await_abandoned_writers(goal_id)
+                out = ThreadFleet(board, self.gate, cfg=config, on_event=push).run()
+        finally:
+            if mode == "worktree" and wt is not None:
+                self._finish_worktree_goal(wt, goal_text, goal_id)
         final = goal_mod.final_result(out.get("board_results", {}))
         counts = out.get("counts") or {}
         stats = {
@@ -646,9 +761,18 @@ class SwarmRunner:
             self.emit("final", text=final, stats=stats, goal_id=goal_id)
             self._append_history("assistant", final)
             # Auto-generate a skill from this outcome if it taught something reusable
-            # (fire-and-forget; conservative; never blocks or breaks the turn).
+            # (fire-and-forget; conservative; never blocks or breaks the turn). GATE to idle:
+            # the synthesizer is a full background LLM generation that, for most goals, returns
+            # "no skill" — so running it while OTHER queued goals are pending/in-flight just
+            # steals decode bandwidth from real work (seen in live log analysis). Only fire it
+            # when no other queued goal is pending and no other goal is running, mirroring the
+            # curator's idle gate. ``SWARM_SKILL_SYNTH=0`` still disables it entirely.
             try:
-                _skills_synth.synthesize_async(goal_text, final)
+                counts = self.tasks.counts()
+                others_busy = (counts.get("pending", 0) > 0
+                               or counts.get("running", 0) > 1)
+                if not others_busy:
+                    _skills_synth.synthesize_async(goal_text, final)
             except Exception:
                 pass
             return (True, final)

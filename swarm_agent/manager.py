@@ -6,6 +6,10 @@ import os
 import threading
 import time
 
+from fleet import config
+
+from . import audit
+from . import worktree as _worktree
 from .runner import _parse_route
 
 
@@ -19,6 +23,9 @@ class CompletionManager:
         self._stopped = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_eval = 0.0
+        # Goal ids already escalated to the human (TUI + Telegram), so a terminal failure is
+        # announced exactly ONCE, not re-announced on every subsequent heartbeat (§B.3).
+        self._escalated: set[str] = set()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -49,7 +56,133 @@ class CompletionManager:
                 except Exception:
                     pass
 
+    # ── Manager v2 auditor (SWARM_V2 §B) ─────────────────────────────────────────
+    def _park_dir(self) -> str:
+        return os.path.join(os.path.expanduser(config.WORKTREE_ROOT), "parked")
+
+    def _drain_merges(self) -> None:
+        """§B.4: merge completed writing-goal worktrees back to base ONE AT A TIME (sequential,
+        even though the goals ran in parallel) so the base branch never sees an interleaved
+        half-merge. Clean → remove the worktree; conflict → PARK it (never auto-resolve, never
+        delete) and escalate with the conflicting paths."""
+        while True:
+            wt = self.runner.pop_pending_merge()
+            if wt is None:
+                return
+            try:
+                res = _worktree.merge_back(wt)
+            except Exception as e:
+                self.runner.emit("error", text=f"merge of {wt.branch} errored: {e!r}")
+                continue
+            if res.ok:
+                try:
+                    _worktree.remove(wt)
+                except Exception:
+                    pass
+                self.runner.emit("manager",
+                                 text=f"merged {wt.branch} into {wt.base_branch or 'base'}")
+            else:
+                parked = wt.path
+                try:
+                    parked = _worktree.park(wt, park_dir=self._park_dir())
+                except Exception:
+                    pass
+                detail = ", ".join(res.conflicting_paths) or res.message
+                self.runner.emit("error", text=(
+                    f"merge conflict on {wt.branch} ({detail}); parked at {parked} — "
+                    f"needs your attention (resolve and merge by hand)"))
+
+    def _gc_worktrees(self) -> None:
+        """§B.2 worktree-leak: reclaim worktrees belonging to no active goal — UNCHANGED ones
+        pruned, CHANGED ones parked (never deleted). No-op unless parallel writes are on and we
+        are inside a git repo."""
+        if not config.PARALLEL_WRITES:
+            return
+        repo = _worktree.repo_root(os.getcwd())
+        if not repo:
+            return
+        try:
+            res = _worktree.gc_worktrees(
+                config.WORKTREE_ROOT, self.runner.active_goal_ids(), repo=repo,
+                park_dir=self._park_dir(), branch_prefix=config.GOAL_BRANCH_PREFIX)
+        except Exception as e:
+            self.runner.log.event("manager_error", error=f"worktree gc: {e!r}")
+            return
+        if res["pruned"] or res["parked"]:
+            self.runner.emit("manager", text=(
+                f"worktree GC: pruned {len(res['pruned'])} stale, "
+                f"parked {len(res['parked'])} with changes"))
+
+    def _audit(self, now: float, snapshot) -> list[str]:
+        """Bounded auto-remediation over a snapshot (§B.2-B.3). Returns the goal ids escalated
+        this pass. HANG (running + alive + no progress for > STUCK_SECONDS) → interrupt and
+        bounded-requeue via ``fail`` (which terminally fails once the retry budget is spent);
+        every NEWLY terminal goal (hang/thrash exhausted, deadlock) is escalated to the human
+        exactly once. A starved decode gate is reported (held to the heartbeat)."""
+        max_attempts = self.runner.tasks.max_attempts
+        stuck_seconds = float(getattr(config, "STUCK_SECONDS", 600.0))
+        active = self.runner.active_goal_ids()
+        escalated: list[str] = []
+
+        # 1) hang remediation (may push a wedged goal to terminal failure).
+        for rec in snapshot:
+            rid = rec.get("id")
+            if (rec.get("state") == "running" and rid in active
+                    and audit.is_stuck(rec, now, stuck_seconds)):
+                # NB: interrupt() is currently process-global (no per-goal targeting yet), so it
+                # also nudges other live agents — acceptable as a last resort for a goal silent
+                # for > STUCK_SECONDS (>> the per-task TASK_TIMEOUT, i.e. genuinely wedged).
+                try:
+                    self.runner.interrupt()
+                except Exception:
+                    pass
+                state = self.runner.tasks.fail(
+                    rid, "hang: no progress for too long; interrupted by manager")
+                if state != "failed":
+                    self.runner.emit("manager", text=f"interrupted + requeued hung task {rid}")
+
+        # 2) escalate every NEWLY terminal failure exactly once (hang/thrash exhausted, deadlock).
+        for rec in self.runner.tasks.snapshot():
+            rid = rec.get("id")
+            if rec.get("state") == "failed" and rid not in self._escalated:
+                self._escalated.add(rid)
+                self.runner.emit("error", text=(
+                    f"task {rid} failed and needs your attention: "
+                    f"{rec.get('error') or rec.get('goal')}"))
+                escalated.append(rid)
+
+        # 3) gate starvation: workers waiting but nothing decoding → hold + note (server flap).
+        stats = None
+        try:
+            stats = self.runner.gate.stats() if self.runner.gate is not None else None
+        except Exception:
+            stats = None
+        if audit.gate_starved(stats):
+            self.runner.emit("manager",
+                             text="decode gate starved (server flap?) — holding dispatch")
+        return escalated
+
+    def _fail_deadlocked(self, snapshot) -> None:
+        """§2.5 / §B.2: a PENDING goal whose deps include a ``failed`` (or missing) goal can
+        never become dispatchable — terminally fail it with a reason naming the dep, rather
+        than leaving it stuck in the queue forever. ``mark_failed`` is terminal (no requeue),
+        so the auditor does not re-flag it each tick."""
+        by_id = {r.get("id"): r for r in snapshot}
+        for rec in snapshot:
+            dep = audit.deadlocked_dep(rec, by_id)
+            if dep is not None:
+                self.runner.tasks.mark_failed(
+                    rec["id"], f"dependency {dep} failed; goal can never run")
+                self.runner.emit(
+                    "error", text=f"task {rec['id']} deadlocked: dependency {dep} failed")
+
     def _tick(self) -> None:
+        # §B.4: land any completed writing-goal worktrees first (sequential merge-back).
+        self._drain_merges()
+        snapshot = self.runner.tasks.snapshot()
+        # Fail goals deadlocked behind a failed dependency BEFORE dispatch (so a deadlocked
+        # goal never blocks the queue and is reported promptly).
+        self._fail_deadlocked(snapshot)
         snapshot = self.runner.tasks.snapshot()
         # Re-queue stalled work: a record marked 'running' whose turn is NOT actually in
         # flight (orphaned by a crash/dead thread). With parallel goals we can no longer use
@@ -59,6 +192,8 @@ class CompletionManager:
             if rec.get("state") == "running" and rec["id"] not in active:
                 self.runner.tasks.requeue(rec["id"])
                 self.runner.emit("manager", text=f"re-queued stalled task {rec['id']}")
+        # §B.2-B.3: bounded auto-remediation (hang interrupt+requeue, terminal escalation).
+        self._audit(time.time(), self.runner.tasks.snapshot())
 
         # Dispatch up to capacity. Probe the server ONCE: if it is down, hold all pending
         # work (back off to the heartbeat) rather than claim-then-requeue churn.
@@ -83,6 +218,9 @@ class CompletionManager:
                         break
                     self.runner.emit("manager",
                                      text=f"starting queued task: {rec['goal'][:60]}")
+
+        # §B.2: reclaim leaked worktrees (prune unchanged / park changed). Cheap dir scan.
+        self._gc_worktrees()
 
         now = time.time()
         if self.runner.tasks.has_unfinished() and now - self._last_eval >= self.interval_s:

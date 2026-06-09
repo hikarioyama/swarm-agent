@@ -34,6 +34,76 @@ def _extract_json(text: str):
     raise ValueError("planner did not return a JSON task array")
 
 
+def _extract_obj(text: str):
+    """Tolerant JSON-OBJECT parse (bare or embedded in prose), mirroring runner._parse_route.
+    Returns the dict or None — never raises. (``_extract_json`` above hunts for an ARRAY.)"""
+    candidates = [text]
+    if "{" in text and "}" in text:
+        candidates.append(text[text.find("{"): text.rfind("}") + 1])
+    for cand in candidates:
+        cand = (cand or "").strip()
+        if not cand:
+            continue
+        try:
+            data = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+ANALYZE_DEPS_PROMPT = """A swarm runs queued goals concurrently. Decide whether a NEW goal must
+WAIT for any already-queued goals because it CONSUMES their result (an ordering dependency).
+
+Only mark a dependency when the new goal genuinely needs another goal's OUTPUT to exist first
+(e.g. "write tests for endpoint X" needs "implement endpoint X"). Do NOT mark a dependency just
+because two goals touch related areas — independent goals should run in parallel (file-write
+conflicts are handled separately, not here). When unsure, prefer INDEPENDENT (empty list).
+
+Already-queued goals (id + goal):
+{existing}
+
+NEW goal:
+{new}
+
+Reply with ONLY a JSON object, nothing else:
+  {{"deps":["<id of a goal the NEW goal must wait for>", ...]}}
+Use ONLY ids from the list above; an empty list means the new goal is independent."""
+
+
+def analyze_deps(new_goal: str, existing, *, run_agent) -> list[str]:
+    """Return the ids of already-queued goals the NEW goal must wait for (inter-goal DAG edges).
+
+    ``run_agent`` is an injectable callable ``(lane, prompt, task_id, **kw) -> str`` (default in
+    production: ``runner._run_agent``) so offline tests pass a fake returning canned JSON — no
+    inference server is touched. FAIL OPEN: no candidates, an empty/garbled reply, or any error
+    → ``[]`` (independent; a wrong "ordered" needlessly serialises, and real WRITE conflicts are
+    caught at merge anyway — §6.1). Only ids that exist in ``existing`` survive."""
+    candidates = [e for e in (existing or []) if e.get("id")]
+    if not candidates:
+        return []
+    rows = [{"id": e["id"], "goal": str(e.get("goal") or "")[:160]} for e in candidates]
+    prompt = ANALYZE_DEPS_PROMPT.format(
+        existing=json.dumps(rows, ensure_ascii=False), new=str(new_goal)[:400])
+    try:
+        text = run_agent("manager", prompt, "analyze-deps", max_iterations=1, max_tokens=512)
+    except Exception:
+        return []
+    data = _extract_obj(text or "")
+    deps = data.get("deps") if isinstance(data, dict) else None
+    if not isinstance(deps, list):
+        return []
+    valid = {e["id"] for e in candidates}
+    seen, out = set(), []
+    for dep in deps:
+        d = str(dep)
+        if d in valid and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
 def validate_tasks(tasks: Iterable[Task]) -> list[Task]:
     """Return a validated acyclic DAG with exactly one reducer sink.
 

@@ -435,6 +435,130 @@ def test_lane_writes_is_shared_between_config_and_goal() -> None:
     assert goal_lane_writes("writer") == config_lane_writes("writer")
 
 
+# ── Phase 0 — liveness fix (SWARM_V2_TODO §B.1) ──────────────────────────────
+
+def test_push_event_advances_goal_progress(tmp_path, monkeypatch) -> None:
+    # P0.1: every fleet task event must touch the goal's progress_at so a healthy long goal
+    # stays "alive" to the manager (today progress_at only moved at start, so running+stuck
+    # and running+progressing looked identical). Inject a fake clock; assert progress_at
+    # tracks the LAST event's time, not the claim time.
+    from swarm_agent import runner as runner_mod
+    from swarm_agent import taskstore as taskstore_mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(taskstore_mod, "_now", lambda: clock["t"])
+
+    runner = SwarmRunner(warm=False, admission="static")
+    runner._setup_done = True
+    runner.tasks = TaskStore(str(tmp_path / "tasks.json"))
+    runner.tasks.add("edit a file")
+    claimed = runner.tasks.claim_next()                   # -> running, progress_at = 1000
+    gid = claimed["id"]
+
+    plan = validate_tasks([
+        Task(id="w", prompt="draft", lane="writer"),
+        Task(id="r", prompt="reduce", deps=["w"], lane="reducer"),
+    ])
+    monkeypatch.setattr(runner, "_plan", lambda goal: plan)
+    monkeypatch.setattr(runner_mod._skills_synth, "synthesize_async", lambda *a, **k: None)
+
+    class FakeFleet:
+        def __init__(self, board, gate, *, cfg=None, on_event=None):
+            self._on = on_event
+
+        def run(self):
+            for _ in range(3):
+                clock["t"] += 10                          # 1010, 1020, 1030
+                self._on("done", "w", {})
+            results = {
+                "w": Task(id="w", prompt="draft", lane="writer"),
+                "r": Task(id="r", prompt="reduce", deps=["w"], lane="reducer"),
+            }
+            results["r"].result = "final deliverable"
+            return {"board_results": results, "counts": {"done": 2}}
+
+    monkeypatch.setattr(runner_mod, "ThreadFleet", FakeFleet)
+
+    ok, out = runner._run_swarm("edit a file", goal_id=gid)
+    assert ok and out == "final deliverable"
+    snap = {r["id"]: r for r in runner.tasks.snapshot()}
+    assert snap[gid]["progress_at"] == 1030.0             # advanced by the events, not 1000
+    runner.shutdown()
+
+
+def test_seconds_since_progress_is_pure(tmp_path) -> None:
+    # P0.2: one pure definition of "stale" the manager relies on.
+    store = TaskStore(str(tmp_path / "tasks.json"))
+    rec = store.add("g", now=100.0)                       # progress_at = 100
+    assert store.seconds_since_progress(rec["id"], now=190.0) == 90.0
+    store.touch(rec["id"], now=250.0)
+    assert store.seconds_since_progress(rec["id"], now=250.0) == 0.0
+    assert store.seconds_since_progress("missing", now=190.0) is None
+
+
+def test_is_stuck_distinguishes_progressing_from_hung() -> None:
+    # P0.3: with progress_at advancing on task events, the auditor flags ONLY a running goal
+    # that has gone silent — not a running goal that is still emitting events.
+    from swarm_agent import audit
+    now = 10_000.0
+    stuck_seconds = 600.0
+    fresh = {"state": "running", "progress_at": now - 10}      # 10s ago — progressing
+    stale = {"state": "running", "progress_at": now - 9_000}   # 9000s ago — hung
+    done = {"state": "done", "progress_at": now - 9_000}       # finished, never "stuck"
+    assert not audit.is_stuck(fresh, now, stuck_seconds)
+    assert audit.is_stuck(stale, now, stuck_seconds)
+    assert not audit.is_stuck(done, now, stuck_seconds)
+    assert not audit.is_stuck(stale, now, 0)                   # disabled threshold → never
+    flagged = [r for r in (fresh, stale, done) if audit.is_stuck(r, now, stuck_seconds)]
+    assert flagged == [stale]
+
+
+# ── §6.1 regression guard — PARALLEL_WRITES=0 behaves exactly like today ──────
+
+def test_regression_writing_goal_no_parallel_writes_uses_sandbox_not_worktree(
+        tmp_path, monkeypatch) -> None:
+    # §6.1: with FLEET_PARALLEL_WRITES off (the default), a K=1 writing goal must take the
+    # LEGACY private-sandbox exclusive path — never a worktree — byte-for-byte like today.
+    from fleet import compat, config
+    from swarm_agent import runner as runner_mod
+    monkeypatch.setattr(config, "PARALLEL_WRITES", False)
+
+    runner = SwarmRunner(warm=False, admission="static")
+    runner._setup_done = True
+    runner._max_goals = 1
+    runner.tasks = TaskStore(str(tmp_path / "tasks.json"))
+    gid = "task-legacy01"
+    plan = validate_tasks([
+        Task(id="c", prompt="edit", lane="coder"),
+        Task(id="r", prompt="reduce", deps=["c"], lane="reducer"),
+    ])
+    monkeypatch.setattr(runner, "_plan", lambda goal: plan)
+    monkeypatch.setattr(runner_mod._skills_synth, "synthesize_async", lambda *a, **k: None)
+    captured = {}
+
+    class FakeFleet:
+        def __init__(self, board, gate, *, cfg=None, on_event=None):
+            pass
+
+        def run(self):
+            captured["wt"] = compat.goal_worktree_for(f"{gid}.c")   # expect None
+            captured["sandbox_root"] = compat._SANDBOX_ROOT          # expect a private mkdtemp
+            results = {
+                "c": Task(id="c", prompt="edit", lane="coder"),
+                "r": Task(id="r", prompt="reduce", deps=["c"], lane="reducer"),
+            }
+            results["r"].result = "ok"
+            return {"board_results": results, "counts": {}}
+
+    monkeypatch.setattr(runner_mod, "ThreadFleet", FakeFleet)
+    ok, _ = runner._run_swarm("edit the code", goal_id=gid)
+    assert ok
+    assert captured["wt"] is None                            # NO worktree under PARALLEL_WRITES=0
+    assert captured["sandbox_root"] is not None              # legacy private sandbox was active
+    assert "swarm-goal-" in str(captured["sandbox_root"])
+    runner.shutdown()
+
+
 if __name__ == "__main__":
     test_scheduler_caps_concurrent_readers_and_wakes_waiter()
     test_scheduler_writer_preference_blocks_new_readers()
@@ -461,4 +585,12 @@ if __name__ == "__main__":
             setattr(obj, name, value)
     test_runner_abandoned_writer_gate_waits_then_proceeds(_MonkeyPatch())
     test_lane_writes_is_shared_between_config_and_goal()
+    with TemporaryDirectory() as tmp:
+        test_push_event_advances_goal_progress(Path(tmp), _MonkeyPatch())
+    with TemporaryDirectory() as tmp:
+        test_seconds_since_progress_is_pure(Path(tmp))
+    test_is_stuck_distinguishes_progressing_from_hung()
+    with TemporaryDirectory() as tmp:
+        test_regression_writing_goal_no_parallel_writes_uses_sandbox_not_worktree(
+            Path(tmp), _MonkeyPatch())
     print("parallel goals offline smoke passed")

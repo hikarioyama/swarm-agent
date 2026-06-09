@@ -127,7 +127,24 @@ AIMD_SATURATION = _envf("FLEET_AIMD_SAT", 0.9)       # only grow if running >= l
 # opted in (set FLEET_MAX_CONCURRENT_GOALS=2 or 3 to enable). FLEET_PARALLEL_WRITES is
 # reserved (default OFF): writing goals stay exclusive regardless in Phase 1.
 MAX_CONCURRENT_GOALS = _envi("FLEET_MAX_CONCURRENT_GOALS", 1)
+
+# ── Swarm v2 (SWARM_V2_TODO) ─────────────────────────────────────────────────
+# FLEET_PARALLEL_WRITES is now LOAD-BEARING (Phase 1): when ON, a writing QUEUED goal runs
+# inside its own git worktree on branch <FLEET_GOAL_BRANCH_PREFIX><goal_id> and takes a
+# SHARED (reader-style) scheduler permit instead of the exclusive writer permit, so ≥K
+# disjoint writers run concurrently and merge back sequentially. OFF (default) keeps today's
+# exclusive single-writer behaviour. Non-git working dirs always fall back to exclusive.
 PARALLEL_WRITES = os.environ.get("FLEET_PARALLEL_WRITES", "0") not in ("0", "false", "False")
+# Where per-goal worktrees are created (one ``wt-<goal_id>`` dir each; shared object store).
+WORKTREE_ROOT = (os.environ.get("FLEET_WORKTREE_ROOT")
+                 or str(__import__("pathlib").Path.home() / ".cache" / "swarm-agent" / "worktrees"))
+# Branch name prefix for per-goal worktree branches (must be non-empty).
+GOAL_BRANCH_PREFIX = os.environ.get("FLEET_GOAL_BRANCH_PREFIX", "swarm/")
+# A RUNNING goal is "stuck" (hung) once it emits no fleet task event for this many seconds
+# (§B.1 liveness). Must exceed a healthy task's gap between events — i.e. > TASK_TIMEOUT_S —
+# so a slow-but-progressing goal is never mistaken for a hang. 0/negative disables hang
+# detection (the manager then never auto-remediates a hang).
+STUCK_SECONDS = _envf("FLEET_STUCK_SECONDS", 600.0)
 
 # ── Persistent board (None = in-memory) ──────────────────────────────────────
 BOARD_PATH = os.environ.get("FLEET_BOARD_PATH") or None
@@ -290,6 +307,14 @@ def validate() -> None:
         problems.append(
             f"MAX_CONCURRENT_GOALS must be >= 1; got {MAX_CONCURRENT_GOALS} "
             f"(env FLEET_MAX_CONCURRENT_GOALS)")
+    # Swarm v2 (Phase 1) invariants.
+    if STUCK_SECONDS <= 0:
+        problems.append(
+            f"STUCK_SECONDS must be > 0 (a hang threshold of 0 flags every running goal as "
+            f"stuck); got {STUCK_SECONDS} (env FLEET_STUCK_SECONDS)")
+    if not GOAL_BRANCH_PREFIX:
+        problems.append(
+            "GOAL_BRANCH_PREFIX must be a non-empty branch prefix (env FLEET_GOAL_BRANCH_PREFIX)")
     if problems:
         raise ValueError(
             "fleet.config: invalid configuration:\n  - " + "\n  - ".join(problems))
