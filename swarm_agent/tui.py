@@ -168,16 +168,34 @@ def _hard_break(token: str, width: int) -> list[str]:
     return pieces or [""]
 
 
-def _cursor_rowcol(text: str, cursor: int, width: int) -> tuple[int, int]:
-    """Map a caret char-index into ``(row, col_cells)`` for ``_hard_break`` wrapping.
+def _wrap_input(text: str, width: int) -> list[str]:
+    """Wrap a possibly multi-line composer buffer into visual rows.
 
-    Replays the same cell-width split so the on-screen caret lands exactly where the
-    next typed glyph will appear — including the trailing empty line that ``draw``
-    appends when the last wrapped line is full.
+    Splits on explicit ``\\n`` first (Shift+Enter / pasted newlines), then hard-breaks
+    each logical line to ``width`` cells. A trailing ``\\n`` yields a final empty row so
+    the caret has somewhere to sit on the fresh line.
+    """
+    rows: list[str] = []
+    for logical in text.split("\n"):
+        rows.extend(_hard_break(logical, width))
+    return rows or [""]
+
+
+def _cursor_rowcol(text: str, cursor: int, width: int) -> tuple[int, int]:
+    """Map a caret char-index into ``(row, col_cells)`` for ``_wrap_input`` wrapping.
+
+    Replays the same cell-width split — including explicit ``\\n`` line breaks — so the
+    on-screen caret lands exactly where the next typed glyph will appear, including the
+    trailing empty line that ``draw`` appends when the last wrapped line is full.
     """
     cursor = max(0, min(cursor, len(text)))
     row, col = 0, 0
     for i, ch in enumerate(text):
+        if ch == "\n":
+            if i == cursor:                 # caret sits at the end of the current row
+                return row, col
+            row, col = row + 1, 0           # explicit break → next visual row
+            continue
         cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
         if col and col + cw > width:        # piece boundary (mirrors _hard_break)
             row, col = row + 1, 0
@@ -187,6 +205,127 @@ def _cursor_rowcol(text: str, cursor: int, width: int) -> tuple[int, int]:
     if col and col >= width:                # caret past a full last line → fresh row
         return row + 1, 0
     return row, col
+
+
+def _mods_has_shift(mods: str) -> bool:
+    """True if an xterm/kitty modifier param (``1`` + bitmask) carries the Shift bit."""
+    base = mods.split(":")[0]                # kitty may append an event-type, e.g. "2:1"
+    try:
+        return bool((int(base) - 1) & 1)    # shift=1, alt=2, ctrl=4, super=8
+    except ValueError:
+        return False
+
+
+def _mods_is_plain(mods: str) -> bool:
+    """True when no modifier is active (param absent or the literal ``1``).
+
+    Used to gate text insertion: a CSI-u/modifyOtherKeys printable carrying Ctrl/Alt/
+    Super must NOT be typed into the buffer (that would corrupt e.g. Ctrl+D / Ctrl+A),
+    so only an unmodified codepoint is treated as a character.
+    """
+    return mods.split(":")[0] in ("", "1")
+
+
+def _normalize_paste(text: str) -> str:
+    """Sanitise pasted text: unify newlines, drop other control chars (keep tab)."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        ch for ch in text
+        if ch in "\n\t" or (ch.isprintable() and unicodedata.category(ch) != "Cc")
+    )
+
+
+def _read_paste(read_paste) -> str:
+    """Drain a bracketed-paste body up to the ``ESC [ 201 ~`` terminator.
+
+    ``read_paste`` should be a *patient* reader: a paste over a slow pty/tmux/SSH link
+    can arrive in chunks, so waiting only a few ms per char would truncate the body and
+    leak the tail (and the ``201~`` marker) into normal input. It returns ``None`` only
+    after a generous idle gap, which we treat as a genuinely abandoned paste.
+    """
+    out = ""
+    while True:
+        ch = read_paste()
+        if ch is None:                       # stream idle past the patient gap — give up
+            return _normalize_paste(out)
+        out += ch
+        if out.endswith("\x1b[201~"):
+            return _normalize_paste(out[:-6])
+
+
+def _decode_csi(read_next, read_paste):
+    """Decode a CSI sequence (``ESC [`` already consumed) into a composer event."""
+    params = ""
+    while True:
+        ch = read_next()
+        if ch is None:
+            return ("ignore",)
+        if ch in "0123456789;:<>?":
+            params += ch
+            continue
+        final = ch
+        break
+    if final == "~":
+        if params == "200":                  # bracketed-paste begin
+            return ("paste", _read_paste(read_paste))
+        parts = params.split(";")            # xterm modifyOtherKeys: 27;mods;code
+        if len(parts) >= 3 and parts[0] == "27":
+            mods, code = parts[1], parts[2]
+            if code == "13":
+                return ("newline",) if _mods_has_shift(mods) else ("enter",)
+            # Only an UNMODIFIED printable is typed; Ctrl/Alt/Super combos are ignored
+            # so they can't be smuggled into the buffer as text.
+            if code.isdigit() and _mods_is_plain(mods):
+                glyph = chr(int(code))
+                if glyph.isprintable():
+                    return ("char", glyph)
+        return ("ignore",)
+    if final == "u":                         # kitty CSI-u: code[;mods[:event]]
+        parts = params.split(";")
+        code = parts[0]
+        mods = parts[1] if len(parts) > 1 else "1"
+        if not code.isdigit():
+            return ("ignore",)
+        cp = int(code)
+        if cp == 13:                         # Enter — any modifier breaks the line
+            return ("newline",) if not _mods_is_plain(mods) else ("enter",)
+        if cp == 27:
+            return ("esc",)
+        if cp in (8, 127):
+            return ("backspace",)
+        if cp == 9:                          # Tab — not used by the composer
+            return ("ignore",)
+        # Modified printables (Ctrl+letter etc.) stay as terminal shortcuts, never text.
+        if _mods_is_plain(mods):
+            glyph = chr(cp)
+            if glyph.isprintable():
+                return ("char", glyph)
+        return ("ignore",)
+    return ("ignore",)                       # cursor/function keys: curses handles those
+
+
+def decode_escape(read_next, read_paste=None):
+    """Classify an ESC-initiated input run pulled one raw char at a time.
+
+    ``read_next`` returns the next buffered raw character (str) or ``None`` when the
+    terminal has nothing more queued. ``read_paste`` is an optional *patient* reader
+    used only for a bracketed-paste body (defaults to ``read_next``). Returns a
+    ``(tag, ...)`` event the input loop dispatches: ``paste``/``newline``/``enter``/
+    ``esc``/``char``/``backspace``/``ignore``.
+    """
+    if read_paste is None:
+        read_paste = read_next
+    ch = read_next()
+    if ch is None:                           # lone ESC → the Escape key (legacy mode)
+        return ("esc",)
+    if ch == "[":
+        return _decode_csi(read_next, read_paste)
+    if ch == "O":                            # SS3 (F1-F4 etc.) — swallow the final byte
+        read_next()
+        return ("ignore",)
+    if ch in ("\r", "\n"):                   # Alt+Enter (legacy) → newline
+        return ("newline",)
+    return ("ignore",)                       # other Alt+<key> combos: ignore
 
 
 def _wrap_cells(text: str, width: int) -> list[str]:
@@ -357,6 +496,52 @@ class App:
                 self._log.close()
             except Exception:
                 pass
+
+    # ── terminal input modes (bracketed paste + kitty keyboard) ───────────────
+    def _term_write(self, seq: str) -> None:
+        """Emit a terminal control string straight to the tty (curses-safe; the
+        sequences set modes only and print nothing visible)."""
+        try:
+            with open("/dev/tty", "w") as tty:
+                tty.write(seq)
+                tty.flush()
+        except OSError:
+            pass
+
+    def _enable_input_modes(self) -> None:
+        # Bracketed paste so a multi-line paste arrives as one block (no per-line
+        # auto-submit), and kitty keyboard flag 1 so Shift+Enter is distinguishable
+        # from a bare Enter. Both are silently ignored by terminals lacking support.
+        self._term_write("\x1b[?2004h\x1b[>1u")
+
+    def _disable_input_modes(self) -> None:
+        self._term_write("\x1b[<u\x1b[?2004l")
+
+    def _next_raw(self, timeout_ms: int = 30):
+        """Pull the next buffered raw char during ESC-sequence assembly, or None.
+
+        Escape-sequence bytes are delivered together by the terminal, so a short
+        timeout reliably gathers them without stalling on a lone Escape keypress. A
+        bracketed-paste body uses a more patient timeout (see ``_next_raw_paste``) so a
+        chunked paste over a slow pty/tmux/SSH link is not truncated mid-stream.
+        """
+        self.stdscr.timeout(timeout_ms)
+        try:
+            ch = self.stdscr.get_wch()
+        except (curses.error, KeyboardInterrupt):
+            ch = None
+        finally:
+            self.stdscr.timeout(100)
+        return ch if isinstance(ch, str) else None
+
+    def _next_raw_paste(self):
+        """Patient raw read for a bracketed-paste body (tolerates slow remote links)."""
+        return self._next_raw(timeout_ms=200)
+
+    def _insert(self, s: str) -> None:
+        """Insert ``s`` at the caret and advance it (used by typing/paste/newline)."""
+        self.input = self.input[:self.cursor] + s + self.input[self.cursor:]
+        self.cursor += len(s)
 
     # ── event pump: runner.events -> chat + swarm ─────────────────────────────
     def pump(self) -> None:
@@ -634,7 +819,7 @@ class App:
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
         comp_w = max(1, w - 4)
-        input_lines = _hard_break(self.input, comp_w)
+        input_lines = _wrap_input(self.input, comp_w)
         if self.input and _disp_width(input_lines[-1]) >= comp_w:
             input_lines.append("")
         max_comp_rows = max(1, min(8, h - 6))
@@ -707,7 +892,7 @@ class App:
                     if busy else (self.message or "Type a goal or /help"))
             self._safe(comp_top, 3, _fit(hint, comp_w), pal["dim"])
         self._safe(h - 1, 1,
-                   "Enter send · type mid-run to interject · /stop interrupt · ↑↓ scroll · /help",
+                   "Enter send · Shift+Enter newline · paste ok · /stop interrupt · ↑↓ scroll · /help",
                    pal["dim"])
         try:
             curses.curs_set(1)
@@ -774,6 +959,7 @@ class App:
             # Only NOW (inside a real TUI session) start the completion manager, so it
             # can resume any goals persisted from a previous session and drive the queue.
             self.runner.start_manager()
+            self._enable_input_modes()
             while True:
                 self.pump()
                 self._scrape()
@@ -787,9 +973,28 @@ class App:
                     continue
                 if key == "\x04":                       # Ctrl+D
                     return 0
-                if key == "\x1b":                       # Esc
-                    self.input, self.cursor = "", 0
-                    self.show_help = False
+                if key == "\x1b":                       # ESC-initiated run
+                    # Could be a real Escape, a bracketed paste, or a kitty CSI-u key
+                    # (Shift+Enter). Assemble the rest of the run and dispatch.
+                    tag, *rest = decode_escape(self._next_raw, self._next_raw_paste)
+                    if tag == "paste":
+                        self._insert(rest[0])
+                    elif tag == "newline":
+                        self._insert("\n")
+                    elif tag == "char":
+                        self._insert(rest[0])
+                    elif tag == "backspace":
+                        if self.cursor > 0:
+                            self.input = self.input[:self.cursor - 1] + self.input[self.cursor:]
+                            self.cursor -= 1
+                    elif tag == "enter":
+                        text, self.input, self.cursor = self.input, "", 0
+                        if not self.submit(text):
+                            return 0
+                    elif tag == "esc":
+                        self.input, self.cursor = "", 0
+                        self.show_help = False
+                    # tag == "ignore": swallow the sequence
                 elif key in (curses.KEY_ENTER, "\n", "\r"):
                     text, self.input, self.cursor = self.input, "", 0
                     if not self.submit(text):
@@ -828,6 +1033,7 @@ class App:
                     self.input = self.input[:self.cursor] + key + self.input[self.cursor:]
                     self.cursor += 1
         finally:
+            self._disable_input_modes()
             self.runner.shutdown()
             self._restore_output()
 

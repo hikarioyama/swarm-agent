@@ -9,7 +9,10 @@ parsing, bounded history, and the busy admission guard.
 from __future__ import annotations
 
 from fleet import compat, prompts
-from swarm_agent.tui import parse_command, _disp_width, _hard_break, _cursor_rowcol, ChatLog
+from swarm_agent.tui import (
+    parse_command, _disp_width, _hard_break, _cursor_rowcol, _wrap_input,
+    decode_escape, ChatLog,
+)
 from swarm_agent.dashboard import SwarmView, _GLYPH
 from swarm_agent.runner import SwarmRunner, _parse_route, _HISTORY_CAP
 from swarm_agent.taskstore import TaskStore
@@ -62,6 +65,93 @@ def test_cursor_rowcol_wraps_to_next_row() -> None:
 def test_cursor_rowcol_clamps_out_of_range() -> None:
     assert _cursor_rowcol("abc", -3, 40) == (0, 0)
     assert _cursor_rowcol("abc", 99, 40) == (0, 3)
+
+
+# ── multi-line composer (Shift+Enter / paste newlines) ────────────────────────
+def test_wrap_input_splits_on_explicit_newlines() -> None:
+    # each logical line wraps independently; a trailing newline yields a fresh row.
+    assert _wrap_input("abc\ndef", 40) == ["abc", "def"]
+    assert _wrap_input("abc\n", 40) == ["abc", ""]
+    assert _wrap_input("", 40) == [""]
+    # a long logical line is still hard-broken inside its own segment.
+    assert _wrap_input("abcdef\nx", 4) == ["abcd", "ef", "x"]
+
+
+def test_cursor_rowcol_tracks_explicit_newlines() -> None:
+    txt = "ab\ncd"
+    assert _cursor_rowcol(txt, 0, 40) == (0, 0)
+    assert _cursor_rowcol(txt, 2, 40) == (0, 2)      # caret on the newline → end of row 0
+    assert _cursor_rowcol(txt, 3, 40) == (1, 0)      # first glyph of the next line
+    assert _cursor_rowcol(txt, 5, 40) == (1, 2)      # end of buffer
+    # trailing newline parks the caret on an empty fresh row.
+    assert _cursor_rowcol("ab\n", 40 - 0, 40) == (1, 0)
+
+
+# ── ESC-sequence decoding (paste + kitty/xterm key encodings) ─────────────────
+def _feed(rest: str):
+    """A read_next() over the bytes that follow the initial ESC."""
+    it = iter(rest)
+    return lambda: next(it, None)
+
+
+def test_decode_escape_shift_enter_inserts_newline() -> None:
+    # kitty CSI-u: ESC [ 13 ; 2 u  (13 = Enter keycode, 2 = Shift modifier)
+    assert decode_escape(_feed("[13;2u")) == ("newline",)
+    # any modifier on Enter breaks the line (Ctrl/Alt+Enter too).
+    assert decode_escape(_feed("[13;5u")) == ("newline",)
+    # xterm modifyOtherKeys form: ESC [ 27 ; 2 ; 13 ~
+    assert decode_escape(_feed("[27;2;13~")) == ("newline",)
+    # legacy Alt+Enter: ESC then CR.
+    assert decode_escape(_feed("\r")) == ("newline",)
+
+
+def test_decode_escape_plain_enter_and_escape() -> None:
+    assert decode_escape(_feed("[13u")) == ("enter",)     # unmodified Enter (kitty)
+    assert decode_escape(_feed("[27u")) == ("esc",)       # Escape key (kitty)
+    assert decode_escape(_feed("")) == ("esc",)           # lone ESC (legacy)
+
+
+def test_decode_escape_bracketed_paste_is_one_block() -> None:
+    # CRLF is normalised and the 201~ terminator stripped — no per-line auto-submit.
+    assert decode_escape(_feed("[200~hello\r\nworld\x1b[201~")) == ("paste", "hello\nworld")
+    # a pasted slash-command stays a single buffer (submitted later, intact).
+    assert decode_escape(_feed("[200~/task ship it\x1b[201~")) == ("paste", "/task ship it")
+
+
+def test_decode_escape_ignores_unhandled_sequences() -> None:
+    # a cursor key that leaked past curses keypad decoding is swallowed, not inserted.
+    assert decode_escape(_feed("[A")) == ("ignore",)
+    # SS3 function-key intro is consumed without effect.
+    assert decode_escape(_feed("OP")) == ("ignore",)
+
+
+def test_decode_escape_modified_printables_are_not_typed() -> None:
+    # Under kitty keyboard mode a modifier-bearing printable must NOT land in the buffer
+    # (otherwise Ctrl+D / Ctrl+A etc. would corrupt input). Ctrl+letter = mods "5".
+    assert decode_escape(_feed("[100;5u")) == ("ignore",)   # Ctrl+d
+    assert decode_escape(_feed("[97;3u")) == ("ignore",)    # Alt+a
+    # an UNMODIFIED CSI-u printable is still accepted as a character.
+    assert decode_escape(_feed("[97u")) == ("char", "a")
+    # modifyOtherKeys: a modified printable is ignored, unmodified is typed.
+    assert decode_escape(_feed("[27;5;100~")) == ("ignore",)  # Ctrl+d
+    assert decode_escape(_feed("[27;1;100~")) == ("char", "d")
+
+
+def test_decode_escape_uses_patient_reader_for_paste_body() -> None:
+    # The control reader stops early (simulating a slow link), but the paste body is
+    # drained with a separate patient reader, so a chunked paste is not truncated.
+    control = _feed("[200~")                 # only the begin marker is "immediately" ready
+    body = _feed("chunked\x1b[201~")         # the body trickles in via the patient reader
+    assert decode_escape(control, body) == ("paste", "chunked")
+
+
+def test_cursor_rowcol_matches_wrap_after_full_row_then_newline() -> None:
+    # A logical line that exactly fills the width, followed by an explicit newline: the
+    # caret right after the newline lands on the next visual row (no double-advance).
+    assert _wrap_input("abcd\nx", 4) == ["abcd", "x"]
+    assert _cursor_rowcol("abcd\nx", 5, 4) == (1, 0)   # caret on 'x', visual row 1
+    assert _wrap_input("abcd\n", 4) == ["abcd", ""]
+    assert _cursor_rowcol("abcd\n", 5, 4) == (1, 0)    # caret on the trailing empty row
 
 
 # ── chat log wrapping ─────────────────────────────────────────────────────────
