@@ -27,7 +27,7 @@ from concurrent.futures import thread as _ftypes
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable, Dict, Optional
 
-from . import config, metrics
+from . import config, metrics, v3
 from .worker import has_visible_text, run_task_local
 
 # Serialises the brief ``threading.Thread`` swap in _DaemonThreadPoolExecutor (below).
@@ -168,6 +168,23 @@ class ThreadFleet:
             # wait() returns early if stop is set, so shutdown is prompt.
             self._stop_sampler.wait(self._sample_period)
 
+    def _v3_after_complete(self, tid: str, text: str) -> None:
+        try:
+            chem = v3.parse_chem(text)
+            self.board.record_signal(tid, chem)
+            if not v3.enabled("diversity"):
+                return
+            snapshot = self.board.results()
+            for reducer_tid, task in snapshot.items():
+                if getattr(task, "lane", "") != "reducer" or tid not in getattr(task, "deps", []):
+                    continue
+                deps = getattr(task, "deps", [])
+                if deps and all(snapshot.get(dep) is not None and snapshot[dep].state.value == "done"
+                                for dep in deps):
+                    self.board.spawn_referee(reducer_tid)
+        except Exception:
+            return
+
     def run(self) -> Dict[str, object]:
         """Drive the board to completion. Loop invariant: keep `enrolled` workers
         in flight (re-evaluated each pass so AIMD limit moves take effect), claim
@@ -260,7 +277,9 @@ class ThreadFleet:
                         if not has_visible_text(res.get("text", "")):
                             raise RuntimeError("worker returned an empty visible response")
                         results[tid] = res
-                        self.board.complete(tid, res.get("text", ""))
+                        complete_ok = self.board.complete(tid, res.get("text", ""))
+                        if complete_ok is not False and v3.any_on():
+                            self._v3_after_complete(tid, res.get("text", ""))
                         self._emit("done", tid, counts=tick_counts,
                                    wall_s=res.get("wall_s"),
                                    decode_s=res.get("decode_s"),

@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
+from . import v3
+
 
 class State(str, Enum):
     PENDING = "pending"     # waiting on dependencies
@@ -87,7 +89,13 @@ class Board:
         with self._lock:
             for t in self._tasks.values():
                 self._refresh(t)
-            ready = [t for t in self._tasks.values() if t.state == State.READY][:n]
+            ready = [t for t in self._tasks.values() if t.state == State.READY]
+            if v3.enabled("chemical"):
+                try:
+                    ready = v3.order_by_priority(ready, now=time.time())
+                except Exception:
+                    pass
+            ready = ready[:n]
             for t in ready:
                 t.state = State.RUNNING
                 if t.deps:                       # inject upstream results so reducers can reduce
@@ -101,6 +109,109 @@ class Board:
             t.state, t.result = State.DONE, result
             for o in self._tasks.values():       # unlock dependents
                 self._refresh(o)
+
+    def record_signal(self, tid: str, chem: Optional[Dict[str, Any]]) -> None:
+        if chem is None or not v3.enabled("chemical"):
+            return
+        with self._lock:
+            t = self._tasks.get(tid)
+            if t is None:
+                return
+            t.meta = dict(t.meta or {})
+            t.meta["chem"] = chem
+
+    def stance_signals(self, dep_ids: List[str]) -> List[Dict[str, Any]]:
+        with self._lock:
+            signals = []
+            for tid in dep_ids:
+                t = self._tasks.get(tid)
+                chem = (t.meta or {}).get("chem") if t is not None else None
+                if isinstance(chem, dict):
+                    signals.append(chem)
+            return signals
+
+    def diversity_of(self, dep_ids: List[str]) -> float:
+        return v3.stance_diversity(self.stance_signals(dep_ids))
+
+    def spawn_referee(self, reducer_tid: str, *, kind: str = "contrarian") -> Optional[str]:
+        if not v3.enabled("diversity"):
+            return None
+        with self._lock:
+            reducer = self._tasks.get(reducer_tid)
+            if reducer is None:
+                return None
+            if reducer.state == State.DONE:
+                return None
+            prefix = f"{reducer_tid}:v3_referee:"
+            if any(t.id.startswith(prefix) and t.state != State.DONE for t in self._tasks.values()):
+                return None
+            signals = []
+            for tid in reducer.deps:
+                dep = self._tasks.get(tid)
+                chem = (dep.meta or {}).get("chem") if dep is not None else None
+                if isinstance(chem, dict):
+                    signals.append(chem)
+            rounds_done = int((reducer.meta or {}).get("v3_rounds", 0) or 0)
+            domain = str((reducer.meta or {}).get("domain") or "default")
+            is_suppressed = None
+            if v3.enabled("sleep"):
+                try:
+                    from . import v3_sleep
+                    is_suppressed = v3_sleep.is_suppressed
+                except Exception:
+                    is_suppressed = None
+            decision = v3.quorum_decision(
+                signals,
+                min_diversity=v3.min_diversity(),
+                accept_conf=v3.accept_conf(),
+                max_rounds=v3.max_rounds(),
+                rounds_done=rounds_done,
+                domain=domain,
+                is_suppressed=is_suppressed,
+            )
+            if decision != "need_diversity":
+                return None
+            next_round = rounds_done + 1
+            ref_id = f"{reducer_tid}:v3_referee:{next_round}"
+            if ref_id in self._tasks or next_round > v3.max_rounds():
+                return None
+            chosen_kind = kind
+            if v3.enabled("hebbian"):
+                try:
+                    from . import v3_credit
+                    chosen_kind = v3_credit.order_profiles(
+                        ["contrarian", "domain_expert"], domain
+                    )[0]
+                except Exception:
+                    chosen_kind = kind
+            ref = Task(
+                id=ref_id,
+                prompt=f"Referee for {reducer_tid}",
+                deps=list(reducer.deps),
+                lane="referee",
+                meta={"v3_kind": chosen_kind, "v3_reducer": reducer_tid, "v3_round": next_round},
+            )
+            self._tasks[ref.id] = ref
+            self._refresh(ref)
+            reducer.meta = dict(reducer.meta or {})
+            reducer.meta["v3_rounds"] = next_round
+            reducer.deps = list(reducer.deps) + [ref.id]
+            if reducer.state in (State.READY, State.RUNNING):
+                reducer.state = State.PENDING
+            self._refresh(reducer)
+            return ref.id
+
+    def credit_outcome(self, reducer_tid: str, winning_profile: str, domain: str) -> None:
+        if not v3.enabled("hebbian"):
+            return
+        with self._lock:
+            if reducer_tid not in self._tasks:
+                return
+        try:
+            from . import v3_credit
+            v3_credit.bump_credit(winning_profile, domain)
+        except Exception:
+            pass
 
     def fail(self, tid: str, error: str, max_retries: int) -> bool:
         """Mark failed; requeue if retries remain. Returns True if requeued."""
@@ -590,23 +701,56 @@ class SqliteBoard:
         def _body(conn: sqlite3.Connection) -> List[Task]:
             conn.execute("BEGIN IMMEDIATE")
             self._refresh_all(conn)
-            # Pick the oldest-inserted ready ids (deterministic, FIFO-ish fairness).
+            if not v3.enabled("chemical"):
+                id_rows = conn.execute(
+                    "SELECT id FROM tasks WHERE state='ready' ORDER BY seq LIMIT ?",
+                    (n,),
+                ).fetchall()
+                ids = [r["id"] for r in id_rows]
+                if not ids:
+                    return []
+                placeholders = ",".join("?" * len(ids))
+                rows = conn.execute(
+                    f"UPDATE tasks SET state='running' WHERE id IN ({placeholders}) "
+                    f"AND state='ready' RETURNING *",
+                    ids,
+                ).fetchall()
+                by_id = {r["id"]: self._row_to_task(r) for r in rows}
+                tasks = [by_id[tid] for tid in ids if tid in by_id]
+                for t in tasks:
+                    if t.deps:
+                        dep_rows = conn.execute(
+                            f"SELECT id, result FROM tasks WHERE id IN "
+                            f"({','.join('?' * len(t.deps))})",
+                            t.deps,
+                        ).fetchall()
+                        t.meta = dict(t.meta, dep_results={r["id"]: r["result"] for r in dep_rows})
+                        conn.execute("UPDATE tasks SET meta=? WHERE id=?",
+                                     (json.dumps(t.meta), t.id))
+                return tasks
+            # Pick ready rows in deterministic insertion order, then optionally apply
+            # v3's stable priority ordering before slicing.
             rows = conn.execute(
-                "SELECT id FROM tasks WHERE state='ready' ORDER BY seq LIMIT ?",
-                (n,),
+                "SELECT * FROM tasks WHERE state='ready' ORDER BY seq",
             ).fetchall()
-            ids = [r["id"] for r in rows]
+            tasks = [self._row_to_task(r) for r in rows]
+            try:
+                tasks = v3.order_by_priority(tasks, now=time.time())
+            except Exception:
+                pass
+            tasks = tasks[:n]
+            ids = [t.id for t in tasks]
             if not ids:
                 return []
             placeholders = ",".join("?" * len(ids))
-            claimed_rows = conn.execute(
+            conn.execute(
                 f"UPDATE tasks SET state='running' WHERE id IN ({placeholders}) "
-                f"AND state='ready' RETURNING *",
+                f"AND state='ready'",
                 ids,
-            ).fetchall()
-            tasks = [self._row_to_task(r) for r in claimed_rows]
+            )
             # Inject upstream results so reducers can reduce (same contract as Board).
             for t in tasks:
+                t.state = State.RUNNING
                 if t.deps:
                     dep_rows = conn.execute(
                         f"SELECT id, result FROM tasks WHERE id IN "
@@ -619,6 +763,132 @@ class SqliteBoard:
             return tasks
 
         return self._run_locked(_body)
+
+    def record_signal(self, tid: str, chem: Optional[Dict[str, Any]]) -> None:
+        if chem is None or not v3.enabled("chemical"):
+            return
+
+        def _body(conn: sqlite3.Connection) -> None:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT meta FROM tasks WHERE id=?", (tid,)).fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["meta"]) if row["meta"] else {}
+            meta["chem"] = chem
+            conn.execute("UPDATE tasks SET meta=? WHERE id=?", (json.dumps(meta), tid))
+
+        self._run_locked(_body)
+
+    def stance_signals(self, dep_ids: List[str]) -> List[Dict[str, Any]]:
+        if not dep_ids:
+            return []
+        placeholders = ",".join("?" * len(dep_ids))
+        conn = self._conn()
+        rows = conn.execute(
+            f"SELECT id, meta FROM tasks WHERE id IN ({placeholders})",
+            dep_ids,
+        ).fetchall()
+        by_id = {r["id"]: json.loads(r["meta"]) if r["meta"] else {} for r in rows}
+        signals: List[Dict[str, Any]] = []
+        for tid in dep_ids:
+            chem = by_id.get(tid, {}).get("chem")
+            if isinstance(chem, dict):
+                signals.append(chem)
+        return signals
+
+    def diversity_of(self, dep_ids: List[str]) -> float:
+        return v3.stance_diversity(self.stance_signals(dep_ids))
+
+    def spawn_referee(self, reducer_tid: str, *, kind: str = "contrarian") -> Optional[str]:
+        if not v3.enabled("diversity"):
+            return None
+
+        def _body(conn: sqlite3.Connection) -> Optional[str]:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (reducer_tid,)).fetchone()
+            if row is None:
+                return None
+            if row["state"] == State.DONE.value:
+                return None
+            reducer = self._row_to_task(row)
+            active_ref = conn.execute(
+                "SELECT 1 FROM tasks WHERE json_extract(meta, '$.v3_reducer') = ? "
+                "AND state <> 'done' LIMIT 1",
+                (reducer_tid,),
+            ).fetchone()
+            if active_ref is not None:
+                return None
+            signals = self.stance_signals(reducer.deps)
+            rounds_done = int((reducer.meta or {}).get("v3_rounds", 0) or 0)
+            domain = str((reducer.meta or {}).get("domain") or "default")
+            is_suppressed = None
+            if v3.enabled("sleep"):
+                try:
+                    from . import v3_sleep
+                    is_suppressed = v3_sleep.is_suppressed
+                except Exception:
+                    is_suppressed = None
+            decision = v3.quorum_decision(
+                signals,
+                min_diversity=v3.min_diversity(),
+                accept_conf=v3.accept_conf(),
+                max_rounds=v3.max_rounds(),
+                rounds_done=rounds_done,
+                domain=domain,
+                is_suppressed=is_suppressed,
+            )
+            if decision != "need_diversity":
+                return None
+            next_round = rounds_done + 1
+            if next_round > v3.max_rounds():
+                return None
+            ref_id = f"{reducer_tid}:v3_referee:{next_round}"
+            exists = conn.execute("SELECT 1 FROM tasks WHERE id=?", (ref_id,)).fetchone()
+            if exists is not None:
+                return None
+            ref_deps = list(reducer.deps)
+            chosen_kind = kind
+            if v3.enabled("hebbian"):
+                try:
+                    from . import v3_credit
+                    chosen_kind = v3_credit.order_profiles(
+                        ["contrarian", "domain_expert"], domain
+                    )[0]
+                except Exception:
+                    chosen_kind = kind
+            ref_meta = {"v3_kind": chosen_kind, "v3_reducer": reducer_tid, "v3_round": next_round}
+            conn.execute(
+                """INSERT INTO tasks (id, prompt, deps, lane, state, result, error,
+                                      retries, meta, seq)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (ref_id, f"Referee for {reducer_tid}", json.dumps(ref_deps), "referee",
+                 State.PENDING.value, None, None, 0, json.dumps(ref_meta), self._alloc_seq()),
+            )
+            reducer_meta = dict(reducer.meta or {})
+            reducer_meta["v3_rounds"] = next_round
+            reducer_deps = list(reducer.deps) + [ref_id]
+            reducer_state = State.PENDING.value if reducer.state in (State.READY, State.RUNNING) else reducer.state.value
+            conn.execute(
+                "UPDATE tasks SET deps=?, meta=?, state=? WHERE id=?",
+                (json.dumps(reducer_deps), json.dumps(reducer_meta), reducer_state, reducer_tid),
+            )
+            self._refresh_all(conn)
+            return ref_id
+
+        return self._run_locked(_body)
+
+    def credit_outcome(self, reducer_tid: str, winning_profile: str, domain: str) -> None:
+        if not v3.enabled("hebbian"):
+            return
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT 1 FROM tasks WHERE id=?", (reducer_tid,)).fetchone()
+            if row is None:
+                return
+            from . import v3_credit
+            v3_credit.bump_credit(winning_profile, domain)
+        except Exception:
+            pass
 
     def complete(self, tid: str, result: str) -> bool:
         """Mark a RUNNING task DONE. Returns True if the write landed, False if it was

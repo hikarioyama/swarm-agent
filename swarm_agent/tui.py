@@ -47,7 +47,7 @@ HELP = [
     "/task GOAL      queue a goal; the completion manager runs it to done",
     "/tasks          list the persistent task queue",
     "/btw <q>        ask an INDEPENDENT worker about the current situation (works mid-run)",
-    "mouse drag      select chat text and copy it (the status panel is left alone)",
+    "mouse wheel     scroll the conversation (Shift+drag to select/copy text)",
     "/copy [last]    also copy the conversation (or last reply) to the clipboard",
     "Ctrl+Y          copy the last reply to the clipboard",
     "←→ Ctrl+A/E     move the caret in the composer (Del/Backspace edit at the caret)",
@@ -265,6 +265,22 @@ def _decode_csi(read_next, read_paste):
             continue
         final = ch
         break
+    if final in ("M", "m") and params.startswith("<"):   # SGR mouse: ESC [ < b;x;y M/m
+        btn = params[1:].split(";")[0]
+        if btn == "64" and final == "M":
+            return ("wheel_up",)
+        if btn == "65" and final == "M":
+            return ("wheel_down",)
+        return ("ignore",)
+    if final == "M" and not params:          # legacy X10 mouse: ESC [ M cb cx cy
+        cb = read_next(); read_next(); read_next()
+        if cb is not None:
+            btn = (ord(cb) - 32) & ~0b11100  # strip modifier bits, keep button id
+            if btn == 64:
+                return ("wheel_up",)
+            if btn == 65:
+                return ("wheel_down",)
+        return ("ignore",)
     if final == "~":
         if params == "200":                  # bracketed-paste begin
             return ("paste", _read_paste(read_paste))
@@ -512,10 +528,14 @@ class App:
         # Bracketed paste so a multi-line paste arrives as one block (no per-line
         # auto-submit), and kitty keyboard flag 1 so Shift+Enter is distinguishable
         # from a bare Enter. Both are silently ignored by terminals lacking support.
-        self._term_write("\x1b[?2004h\x1b[>1u")
+        # Mouse: request normal tracking (1000) + SGR encoding (1006) DIRECTLY, not via
+        # curses.mousemask — terminfo entries without kmous/XM make mousemask a silent
+        # no-op, which left some terminals with no wheel scroll. The SGR sequences are
+        # parsed by _decode_csi ourselves, so KEY_MOUSE support is not required either.
+        self._term_write("\x1b[?2004h\x1b[>1u\x1b[?1000;1006h")
 
     def _disable_input_modes(self) -> None:
-        self._term_write("\x1b[<u\x1b[?2004l")
+        self._term_write("\x1b[?1000;1006l\x1b[<u\x1b[?2004l")
 
     def _next_raw(self, timeout_ms: int = 30):
         """Pull the next buffered raw char during ESC-sequence assembly, or None.
@@ -945,13 +965,14 @@ class App:
                 curses.curs_set(1)
             except curses.error:
                 pass
-            # Leave the mouse to the TERMINAL — do NOT enable curses mouse reporting.
-            # With reporting OFF, click-drag works natively, so the user can select and
-            # COPY chat text with the mouse the normal way. (Capturing the mouse for
-            # wheel-scroll would suppress that native selection.) Scroll with the keyboard
-            # instead: ↑↓ / PgUp / PgDn / Home / End; the view also follows the live tail.
+            # Capture the mouse WHEEL so it scrolls the conversation — terminals do not
+            # reliably translate wheel→arrow keys in the alternate screen, so relying on
+            # that left some setups with no wheel scroll at all. Mouse reporting does
+            # suppress native click-drag selection, but every modern terminal bypasses
+            # reporting with Shift+drag, so select/copy stays one modifier away.
             try:
-                curses.mousemask(0)
+                curses.mouseinterval(0)      # deliver wheel events immediately, no click pairing
+                curses.mousemask(curses.BUTTON4_PRESSED | getattr(curses, "BUTTON5_PRESSED", 0))
             except (curses.error, AttributeError):
                 pass
             self.stdscr.nodelay(True)
@@ -994,6 +1015,10 @@ class App:
                     elif tag == "esc":
                         self.input, self.cursor = "", 0
                         self.show_help = False
+                    elif tag == "wheel_up":
+                        self._scroll_by(3)
+                    elif tag == "wheel_down":
+                        self._scroll_by(-3)
                     # tag == "ignore": swallow the sequence
                 elif key in (curses.KEY_ENTER, "\n", "\r"):
                     text, self.input, self.cursor = self.input, "", 0
@@ -1017,6 +1042,15 @@ class App:
                     self.cursor = len(self.input)
                 elif key == "\x19":                      # Ctrl+Y → copy last reply
                     self._copy(last_only=True)
+                elif key == curses.KEY_MOUSE:            # wheel scroll (3 lines per notch)
+                    try:
+                        _, _, _, _, bstate = curses.getmouse()
+                    except curses.error:
+                        continue
+                    if bstate & curses.BUTTON4_PRESSED:
+                        self._scroll_by(3)
+                    elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                        self._scroll_by(-3)
                 elif key == curses.KEY_UP:               # scroll conversation: older
                     self._scroll_by(1)
                 elif key == curses.KEY_DOWN:             # scroll: newer / follow

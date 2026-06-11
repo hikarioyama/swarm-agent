@@ -6,5 +6,13 @@ ROOT="$(cd -- "$(dirname -- "$SCRIPT")/.." && pwd)"
 HERMES_DIR="${HERMES_DIR:-$HOME/.hermes/hermes-agent}"
 PYTHON="${SWARM_PYTHON:-$HERMES_DIR/venv/bin/python}"
 
+# Swarm v3 mechanisms default ON (override with SWARM_V3=0 etc.)
+export SWARM_V3="${SWARM_V3:-1}"
+export SWARM_V3_CHEMICAL="${SWARM_V3_CHEMICAL:-1}"
+export SWARM_V3_DIVERSITY="${SWARM_V3_DIVERSITY:-1}"
+export SWARM_V3_REFLEX="${SWARM_V3_REFLEX:-1}"
+export SWARM_V3_HEBBIAN="${SWARM_V3_HEBBIAN:-1}"
+export SWARM_V3_SLEEP="${SWARM_V3_SLEEP:-1}"
+
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 exec "$PYTHON" -m swarm_agent.cli "$@"
